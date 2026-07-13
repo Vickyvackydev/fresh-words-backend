@@ -1,18 +1,18 @@
 package services
 
 import (
-	"archive/zip"
-	"bytes"
 	"fmt"
-	"io"
+	"log"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
 	"fresh-words-backend/models"
+	"fresh-words-backend/services/extractor"
+	"fresh-words-backend/services/normalizer"
+	"fresh-words-backend/services/reconstructor"
+	"fresh-words-backend/services/typography"
 	"github.com/google/uuid"
-	"github.com/ledongthuc/pdf"
 )
 
 type ValidationIssue struct {
@@ -23,448 +23,255 @@ type ValidationIssue struct {
 }
 
 type ParserReport struct {
-	TotalParsed int               `json:"total_parsed"`
-	IsValid     bool              `json:"is_valid"`
-	Issues      []ValidationIssue `json:"issues"`
+	TotalParsed int                 `json:"total_parsed"`
+	IsValid     bool                `json:"is_valid"`
+	Issues      []ValidationIssue   `json:"issues"`
 	Devotionals []models.Devotional `json:"-"`
 }
 
-// ParseDocument reads the file and extracts a list of devotionals with a validation report.
+// ParseDocument reads the file and extracts a list of devotionals using the new Document Reconstruction Engine.
 func ParseDocument(filePath string, category string, year int, packageID uuid.UUID) (*ParserReport, error) {
-	var rawText string
+	filePathLower := strings.ToLower(filePath)
+	var physicalDoc *extractor.Document
 	var err error
 
-	if strings.HasSuffix(strings.ToLower(filePath), ".pdf") {
-		rawText, err = ReadPdf(filePath)
-	} else if strings.HasSuffix(strings.ToLower(filePath), ".docx") {
-		rawText, err = ReadDocx(filePath)
+	// Step 1: Physical Extraction
+	if strings.HasSuffix(filePathLower, ".pdf") {
+		physicalDoc, err = extractor.ReadPdf(filePath)
+	} else if strings.HasSuffix(filePathLower, ".docx") || strings.HasSuffix(filePathLower, ".doc") {
+		// Attempt to parse .doc as .docx (sometimes users just rename the extension)
+		physicalDoc, err = extractor.ReadDocx(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read DOCX (if this is a legacy .doc file, please convert it to .docx first): %w", err)
+		}
 	} else {
 		return nil, fmt.Errorf("unsupported file format: only PDF and DOCX files are allowed")
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to read file text: %w", err)
+		return nil, fmt.Errorf("failed to extract document: %w", err)
 	}
 
-	return parseRawText(rawText, category, year, packageID)
-}
-
-// ReadPdf extracts plain text from a PDF file.
-func ReadPdf(path string) (string, error) {
-	f, r, err := pdf.Open(path)
+	// Step 2 & 3: Layout Reconstruction (Paragraph merging, Headers/Footers)
+	reconstructedDoc, err := reconstructor.Reconstruct(physicalDoc)
 	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	var buf bytes.Buffer
-	b, err := r.GetPlainText()
-	if err != nil {
-		return "", err
-	}
-	_, err = buf.ReadFrom(b)
-	if err != nil {
-		return "", err
-	}
-	return buf.String(), nil
-}
-
-// ReadDocx extracts text from a DOCX file.
-func ReadDocx(path string) (string, error) {
-	reader, err := zip.OpenReader(path)
-	if err != nil {
-		return "", err
-	}
-	defer reader.Close()
-
-	for _, file := range reader.File {
-		if file.Name == "word/document.xml" {
-			rc, err := file.Open()
-			if err != nil {
-				return "", err
-			}
-			defer rc.Close()
-
-			data, err := io.ReadAll(rc)
-			if err != nil {
-				return "", err
-			}
-
-			xmlStr := string(data)
-			// Replace paragraph endings with newlines
-			xmlStr = regexp.MustCompile(`</w:p>`).ReplaceAllString(xmlStr, "\n")
-			// Strip all XML tags
-			re := regexp.MustCompile(`<[^>]*>`)
-			plainText := re.ReplaceAllString(xmlStr, "")
-			return plainText, nil
-		}
-	}
-	return "", fmt.Errorf("word/document.xml not found in docx zip structure")
-}
-
-// parseRawText splits the raw text into daily blocks and parses fields for each devotional.
-func parseRawText(rawText string, category string, year int, packageID uuid.UUID) (*ParserReport, error) {
-	report := &ParserReport{
-		IsValid:     true,
-		Issues:      []ValidationIssue{},
-		Devotionals: []models.Devotional{},
+		return nil, fmt.Errorf("reconstruction failed: %w", err)
 	}
 
-	// Regex to match date anchors like "January 1" or "December 31"
-	reDate := regexp.MustCompile(`(?i)\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\b`)
-	matches := reDate.FindAllStringSubmatchIndex(rawText, -1)
+	// Step 4: Typography & Semantic Detection
+	semanticDoc := typography.Detect(reconstructedDoc)
 
-	if len(matches) == 0 {
-		report.IsValid = false
-		report.Issues = append(report.Issues, ValidationIssue{
-			Severity: "error",
-			Message:  "Could not find any daily date headers (e.g. 'January 1') in the document. Please check the layout.",
-		})
-		return report, nil
-	}
+	// Step 5: Normalization
+	normalizedDoc := normalizer.Normalize(semanticDoc)
 
-	// Track found days to detect duplicates/missing days
-	daysFound := make(map[int]string)
-
-	for i := 0; i < len(matches); i++ {
-		startIdx := matches[i][0]
-		endIdx := len(rawText)
-		if i+1 < len(matches) {
-			endIdx = matches[i+1][0]
-		}
-
-		dayText := rawText[startIdx:endIdx]
-		matchSub := reDate.FindStringSubmatch(rawText[matches[i][0]:matches[i][1]])
-
-		if len(matchSub) < 3 {
-			continue
-		}
-
-		monthName := strings.Title(strings.ToLower(matchSub[1]))
-		dayNum, _ := strconv.Atoi(matchSub[2])
-
-		dayOfYear := calculateDayOfYear(monthName, dayNum, year)
-		dateStr := fmt.Sprintf("%s %d", monthName, dayNum)
-
-		if dayOfYear <= 0 {
-			report.Issues = append(report.Issues, ValidationIssue{
-				DateText: dateStr,
-				Severity: "warning",
-				Message:  fmt.Sprintf("Invalid date header matched: %s", dateStr),
-			})
-			continue
-		}
-
-		if prevDate, dup := daysFound[dayOfYear]; dup {
-			report.Issues = append(report.Issues, ValidationIssue{
-				DayOfYear: dayOfYear,
-				DateText:  dateStr,
-				Severity:  "warning",
-				Message:   fmt.Sprintf("Duplicate devotional entry detected for day of year %d (%s). Already had %s", dayOfYear, dateStr, prevDate),
-			})
-		}
-		daysFound[dayOfYear] = dateStr
-
-		// Parse the individual block content
-		dev, blockIssues := parseDailyBlock(dayText, category, dayOfYear, packageID)
-		for _, issue := range blockIssues {
-			issue.DayOfYear = dayOfYear
-			issue.DateText = dateStr
-			report.Issues = append(report.Issues, issue)
-			if issue.Severity == "error" {
-				report.IsValid = false
-			}
-		}
-
-		report.Devotionals = append(report.Devotionals, dev)
-	}
-
-	report.TotalParsed = len(report.Devotionals)
-
-	// Check if all 365 (or 366) days are present
-	expectedDays := 365
-	if isLeapYear(year) {
-		expectedDays = 366
-	}
-
-	if len(daysFound) < expectedDays {
-		report.IsValid = false
-		report.Issues = append(report.Issues, ValidationIssue{
-			Severity: "error",
-			Message:  fmt.Sprintf("Missing devotional entries. Expected %d days, but only found %d unique days in the file.", expectedDays, len(daysFound)),
-		})
-	}
+	// Step 7, 8, 9: Parse the Document Tree into Devotional objects
+	report := extractDevotionals(normalizedDoc, category, year, packageID)
 
 	return report, nil
 }
 
-// parseDailyBlock parses a single block of text corresponding to one day using signature-based adjacent line checking.
-func parseDailyBlock(blockText string, category string, dayOfYear int, packageID uuid.UUID) (models.Devotional, []ValidationIssue) {
-	issues := []ValidationIssue{}
-	dev := models.Devotional{
-		ID:        uuid.New(),
-		PackageID: packageID,
-		Category:  category,
-		DefaultDay: dayOfYear,
+// extractDevotionals iterates through the logical blocks to build devotionals based on structure.
+func extractDevotionals(doc *typography.SemanticDocument, category string, year int, packageID uuid.UUID) *ParserReport {
+	report := &ParserReport{
+		IsValid: true,
 	}
 
-	rawLines := strings.Split(blockText, "\n")
-	reRef := regexp.MustCompile(`\((?i)(?:[1-3]\s+)?[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+\d+:\d+(?:-\d+)?\)`)
-	rePage := regexp.MustCompile(`^\d+$`)
-	reDate := regexp.MustCompile(`(?i)\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\b`)
+	var currentDevo *models.Devotional
+	var currentSection string
+	var dayCounter int = 1
 
-	// Clean lines to non-empty, non-page, non-date-header lines
-	type LineInfo struct {
-		text  string
-		index int
-	}
-	var lines []LineInfo
-	for idx, rl := range rawLines {
-		line := strings.TrimSpace(rl)
-		if line == "" {
+	for i := 0; i < len(doc.Blocks); i++ {
+		block := doc.Blocks[i]
+		text := strings.TrimSpace(block.Text)
+
+		if text == "" {
 			continue
 		}
-		if rePage.MatchString(line) {
+
+		isDate := isDateOrDay(text)
+		log.Printf("[PARSER] Evaluating Block - Type: %v, Length: %d, IsDate: %v | Text: %q\n", block.Type, len(text), isDate, text)
+
+		// E.g., "JANUARY 4" or "Day 4"
+		// If it looks like a date and it's short, treat it as the start of a Devotional.
+		// We relax the TypeHeading requirement because some PDFs have dates formatted identically to body text.
+		if isDate && len(text) < 150 {
+			log.Printf("[PARSER] --> NEW DEVOTIONAL BOUNDARY FOUND: %s\n", text)
+			// Save the previous devotional
+			if currentDevo != nil {
+				report.Devotionals = append(report.Devotionals, *currentDevo)
+			}
+
+			currentDevo = &models.Devotional{
+				ID:         uuid.New(),
+				PackageID:  packageID,
+				Category:   category,
+				DefaultDay: dayCounter,
+				CreatedAt:  time.Now(),
+				UpdatedAt:  time.Now(),
+			}
+			dayCounter++
+			currentSection = "Date"
 			continue
 		}
-		if reDate.MatchString(line) {
-			continue
+
+		if currentDevo == nil {
+			continue // skip preamble until the first date/devotional is found
 		}
-		lines = append(lines, LineInfo{text: line, index: idx})
-	}
 
-	if len(lines) == 0 {
-		issues = append(issues, ValidationIssue{
-			Severity: "error",
-			Message:  "Empty or extremely short devotional entry.",
-		})
-		return dev, issues
-	}
+		// State machine based on Headings
+		if block.Type == typography.TypeHeading {
+			upperText := strings.ToUpper(text)
 
-	// 1. Find Title candidate lines (completely uppercase, length < 150, not containing scripture ref)
-	var titleIndices []int
-	for i, l := range lines {
-		cleanLine := regexp.MustCompile(`[^a-zA-Z]`).ReplaceAllString(l.text, "")
-		isUppercase := len(cleanLine) > 0 && cleanLine == strings.ToUpper(cleanLine)
-		hasScriptureRef := reRef.MatchString(l.text)
-
-		if isUppercase && len(l.text) < 150 && !hasScriptureRef {
-			titleIndices = append(titleIndices, i)
-		}
-	}
-
-	// Group adjacent title lines (if any)
-	var titleStart, titleEnd = -1, -1
-	if len(titleIndices) > 0 {
-		titleStart = titleIndices[0]
-		titleEnd = titleIndices[0]
-		for i := 1; i < len(titleIndices); i++ {
-			if titleIndices[i] == titleEnd+1 {
-				titleEnd = titleIndices[i]
-			} else {
-				break
+			// If it's a heading right after Date, it's ALWAYS the Title
+			if currentSection == "Date" {
+				currentDevo.Title = text
+				currentSection = "Title"
+				continue
 			}
-		}
-	}
 
-	// 2. Identify the Main Scripture line based on adjacency to the Title
-	mainScriptureIndex := -1
-	if titleStart != -1 {
-		beforeIdx := titleStart - 1
-		afterIdx := titleEnd + 1
-
-		hasBefore := beforeIdx >= 0 && reRef.MatchString(lines[beforeIdx].text)
-		hasAfter := afterIdx < len(lines) && reRef.MatchString(lines[afterIdx].text)
-
-		if hasBefore && hasAfter {
-			// If both match, pick the shorter one (body paragraph is much longer)
-			if len(lines[beforeIdx].text) < len(lines[afterIdx].text) {
-				mainScriptureIndex = beforeIdx
-			} else {
-				mainScriptureIndex = afterIdx
-			}
-		} else if hasBefore {
-			if len(lines[beforeIdx].text) < 400 {
-				mainScriptureIndex = beforeIdx
-			}
-		} else if hasAfter {
-			if len(lines[afterIdx].text) < 400 {
-				mainScriptureIndex = afterIdx
-			}
-		}
-	}
-
-	// Fallback: Look for the first line in the block that has a scripture reference and is under 400 characters
-	if mainScriptureIndex == -1 {
-		for i, l := range lines {
-			if i != titleStart && i != titleEnd && reRef.MatchString(l.text) && len(l.text) < 400 {
-				mainScriptureIndex = i
-				break
-			}
-		}
-	}
-
-	// 3. Reconstruct fields
-	var titleLines []string
-	if titleStart != -1 {
-		for idx := titleStart; idx <= titleEnd; idx++ {
-			titleLines = append(titleLines, lines[idx].text)
-		}
-		dev.Title = strings.Join(titleLines, " ")
-	} else {
-		issues = append(issues, ValidationIssue{
-			Severity: "warning",
-			Message:  "Could not identify the devotional title.",
-		})
-		dev.Title = "UNTITLED DEVOTIONAL"
-	}
-
-	if mainScriptureIndex != -1 {
-		scriptureLine := lines[mainScriptureIndex].text
-		refMatch := reRef.FindString(scriptureLine)
-		dev.ScriptureReference = strings.Trim(refMatch, "()")
-
-		quote := strings.TrimSpace(strings.Replace(scriptureLine, refMatch, "", -1))
-		quote = strings.TrimSpace(reRef.ReplaceAllString(quote, ""))
-		dev.ScriptureQuote = quote
-	} else {
-		issues = append(issues, ValidationIssue{
-			Severity: "warning",
-			Message:  "Could not find a valid scripture reference (e.g. '(John 3:16)').",
-		})
-		dev.ScriptureReference = "Scripture Reference"
-	}
-
-	// 4. Construct Body and parse sub-sections (Prayer, Reflection, Action Points)
-	var bodyLines []string
-	var prayerLines []string
-	var reflectionLines []string
-	var actionPoints []string
-
-	currentSection := "body"
-
-	for i, l := range lines {
-		if (titleStart != -1 && i >= titleStart && i <= titleEnd) || i == mainScriptureIndex {
-			continue
-		}
-		line := l.text
-		lowerLine := strings.ToLower(line)
-
-		if strings.HasPrefix(lowerLine, "prayer:") {
-			currentSection = "prayer"
-			line = strings.TrimSpace(l.text[7:])
-			if line != "" {
-				prayerLines = append(prayerLines, line)
-			}
-		} else if strings.HasPrefix(lowerLine, "reflection:") {
-			currentSection = "reflection"
-			line = strings.TrimSpace(l.text[11:])
-			if line != "" {
-				reflectionLines = append(reflectionLines, line)
-			}
-		} else if strings.HasPrefix(lowerLine, "action points:") || strings.HasPrefix(lowerLine, "action point:") {
-			currentSection = "action"
-			line = strings.TrimSpace(strings.TrimPrefix(lowerLine, "action points:"))
-			line = strings.TrimSpace(strings.TrimPrefix(line, "action point:"))
-			if line != "" {
-				actionPoints = append(actionPoints, line)
-			}
-		} else {
-			switch currentSection {
-			case "body":
-				bodyLines = append(bodyLines, line)
-			case "prayer":
-				prayerLines = append(prayerLines, line)
-			case "reflection":
-				reflectionLines = append(reflectionLines, line)
-			case "action":
-				cleanLine := regexp.MustCompile(`^[-*\d\.\s]+`).ReplaceAllString(line, "")
-				if cleanLine != "" {
-					actionPoints = append(actionPoints, cleanLine)
+			// Avoid matching titles containing the keywords by enforcing a length threshold
+			isSectionHeader := false
+			if len(text) < 35 {
+				switch {
+				case strings.Contains(upperText, "PRAYER") || strings.Contains(upperText, "PRAYER POINT"):
+					currentSection = "Prayer"
+					isSectionHeader = true
+				case strings.Contains(upperText, "CONFESSION") || strings.Contains(upperText, "REFLECTION"):
+					currentSection = "Reflection"
+					isSectionHeader = true
+				case strings.Contains(upperText, "FURTHER READING"):
+					currentSection = "FurtherReading"
+					isSectionHeader = true
+				case strings.Contains(upperText, "MEMORY VERSE"):
+					currentSection = "MemoryVerse"
+					isSectionHeader = true
+				case strings.Contains(upperText, "KEY POINT") || strings.Contains(upperText, "ACTION POINT"):
+					currentSection = "ActionPoints"
+					isSectionHeader = true
+				case strings.Contains(upperText, "DECLARATION"):
+					currentSection = "Declaration"
+					isSectionHeader = true
 				}
 			}
-		}
-	}
 
-	if len(bodyLines) == 0 {
-		issues = append(issues, ValidationIssue{
-			Severity: "error",
-			Message:  "Devotional body text is missing.",
-		})
-	} else {
-		// Clean up drop caps
-		firstLine := bodyLines[0]
-		if len(firstLine) > 2 && firstLine[1] == ' ' && firstLine[0] >= 'A' && firstLine[0] <= 'Z' && firstLine[2] >= 'a' && firstLine[2] <= 'z' {
-			bodyLines[0] = string(firstLine[0]) + firstLine[2:]
-		}
-		dev.Body = strings.Join(bodyLines, "\n\n")
-	}
-
-	if len(prayerLines) > 0 {
-		dev.Prayer = strings.Join(prayerLines, " ")
-	}
-	if len(reflectionLines) > 0 {
-		dev.Reflection = strings.Join(reflectionLines, " ")
-	}
-
-	// Serialize action points to JSON array
-	if len(actionPoints) > 0 {
-		var apBuilder strings.Builder
-		apBuilder.WriteString("[")
-		for i, ap := range actionPoints {
-			apBuilder.WriteString(fmt.Sprintf("%q", ap))
-			if i+1 < len(actionPoints) {
-				apBuilder.WriteString(",")
+			if isSectionHeader {
+				continue
 			}
+
+			// If it's a heading block during Title state, append it to Title (multi-line title)
+			if currentSection == "Title" {
+				currentDevo.Title += " " + text
+				continue
+			}
+
+			// Fallback for unknown headings
+			currentSection = "Body"
+			if currentDevo.Body != "" {
+				currentDevo.Body += "\n\n"
+			}
+			currentDevo.Body += "**" + text + "**"
+			continue
 		}
-		apBuilder.WriteString("]")
-		dev.ActionPoints = apBuilder.String()
+
+		// Paragraphs map to the active section
+		switch currentSection {
+		case "Title":
+			// Extract both scripture quote and reference if they reside in the same block
+			ref, quote, found := extractScripture(text)
+			if found {
+				currentDevo.ScriptureReference = ref
+				if quote != "" {
+					currentDevo.ScriptureQuote = quote
+					currentSection = "Body"
+				} else {
+					currentSection = "ScriptureQuote"
+				}
+			} else {
+				currentDevo.Body += text
+				currentSection = "Body"
+			}
+		case "ScriptureQuote":
+			currentDevo.ScriptureQuote += text
+			currentSection = "Body"
+		case "Prayer":
+			if currentDevo.Prayer != "" {
+				currentDevo.Prayer += "\n"
+			}
+			currentDevo.Prayer += text
+		case "Reflection":
+			if currentDevo.Reflection != "" {
+				currentDevo.Reflection += "\n"
+			}
+			currentDevo.Reflection += text
+		case "ActionPoints":
+			if currentDevo.ActionPoints != "" {
+				currentDevo.ActionPoints += "\n"
+			}
+			currentDevo.ActionPoints += text
+		case "Body":
+			if currentDevo.Body != "" {
+				currentDevo.Body += "\n\n"
+			}
+			currentDevo.Body += text
+		default:
+			if currentDevo.Body != "" {
+				currentDevo.Body += "\n\n"
+			}
+			currentDevo.Body += text
+		}
 	}
 
-	return dev, issues
+	// Append the very last devotional
+	if currentDevo != nil {
+		report.Devotionals = append(report.Devotionals, *currentDevo)
+	}
+
+	report.TotalParsed = len(report.Devotionals)
+
+	if report.TotalParsed == 0 {
+		report.IsValid = false
+		report.Issues = append(report.Issues, ValidationIssue{
+			Severity: "error",
+			Message:  "No devotionals could be extracted. Check date headings.",
+		})
+	}
+
+	return report
 }
 
-func calculateDayOfYear(month string, day int, year int) int {
-	var m time.Month
-	switch strings.ToLower(month) {
-	case "january":
-		m = time.January
-	case "february":
-		m = time.February
-	case "march":
-		m = time.March
-	case "april":
-		m = time.April
-	case "may":
-		m = time.May
-	case "june":
-		m = time.June
-	case "july":
-		m = time.July
-	case "august":
-		m = time.August
-	case "september":
-		m = time.September
-	case "october":
-		m = time.October
-	case "november":
-		m = time.November
-	case "december":
-		m = time.December
-	default:
-		return -1
-	}
-
-	t := time.Date(year, m, day, 0, 0, 0, 0, time.UTC)
-	if t.Year() != year || t.Month() != m || t.Day() != day {
-		return -1
-	}
-	return t.YearDay()
+// Helpers
+func isDateOrDay(text string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(text))
+	// Match things like "JANUARY 4", "Jan 4", "DAY 4"
+	re := regexp.MustCompile(`^(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER|JAN|FEB|MAR|APR|JUN|JUL|AUG|SEP|OCT|NOV|DEC|DAY)\s+\d{1,2}`)
+	return re.MatchString(upper)
 }
 
-func splitIntoLines(text string) []string {
-	// Normalize line endings
-	normalized := strings.ReplaceAll(text, "\r\n", "\n")
-	normalized = strings.ReplaceAll(normalized, "\r", "\n")
-	return strings.Split(normalized, "\n")
+func isScriptureReference(text string) bool {
+	return strings.Contains(text, ":") || strings.Contains(text, " 1 ") || strings.Contains(text, " 2 ")
+}
+
+func extractScripture(text string) (ref string, quote string, found bool) {
+	// Match book, chapter and verse (e.g. Luke 18:1, 1 Corinthians 13:4-8, Psalm 68:9)
+	re := regexp.MustCompile(`\(?((?:[1-9]\s+)?[A-Za-z]+(?:\s+[A-Za-z]+)*\s+\d+:\d+(?:-\d+)?)\)?`)
+	loc := re.FindStringSubmatchIndex(text)
+	if loc == nil {
+		// Fallback to match book and chapter only (e.g. "1 Chronicles 29")
+		reNoVerse := regexp.MustCompile(`\(?((?:[1-9]\s+)?[A-Za-z]+(?:\s+[A-Za-z]+)*\s+\d+)\)?`)
+		loc = reNoVerse.FindStringSubmatchIndex(text)
+		if loc == nil {
+			return "", "", false
+		}
+	}
+
+	ref = text[loc[2]:loc[3]]
+	
+	// Remove the matched reference from the text to get the quote
+	rawQuote := text[:loc[0]] + text[loc[1]:]
+	rawQuote = strings.TrimSpace(rawQuote)
+	// Clean up quotes, brackets and trailing punctuation
+	rawQuote = strings.Trim(rawQuote, `()[]{}""'';,. `)
+	rawQuote = strings.TrimSpace(rawQuote)
+
+	return ref, rawQuote, true
 }

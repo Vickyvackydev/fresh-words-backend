@@ -68,11 +68,17 @@ func UploadPackageHandler(c *gin.Context) {
 	// Parse file
 	report, err := services.ParseDocument(filePath, category, year, packageID)
 	if err != nil {
-		utils.SendError(c, http.StatusUnprocessableEntity, "Document parsing failed", err.Error())
+		utils.SendError(c, http.StatusUnprocessableEntity, "Document parsing failed — could not extract text from file", err.Error())
 		return
 	}
 
-	// Save Package and Devotionals in transaction
+	// If no devotionals were extracted at all, bail early without saving
+	if len(report.Devotionals) == 0 {
+		utils.SendError(c, http.StatusUnprocessableEntity, "No devotional entries could be parsed from this document. Please check the document format and ensure each day starts with 'Month Day' (e.g. 'January 1') on its own line.", report.Issues)
+		return
+	}
+
+	// Save Package and Devotionals in transaction (even if not fully valid — save as draft for review)
 	dbErr := db.DB.Transaction(func(tx *gorm.DB) error {
 		uploadedAt := time.Now()
 		if len(report.Devotionals) > 0 {
@@ -112,7 +118,12 @@ func UploadPackageHandler(c *gin.Context) {
 		"issues":       report.Issues,
 	}
 
-	utils.SendSuccess(c, http.StatusOK, "File uploaded and parsed successfully", response)
+	message := "File uploaded and parsed successfully"
+	if !report.IsValid || len(report.Issues) > 0 {
+		message = fmt.Sprintf("File uploaded and saved as draft with %d issue(s). Review the issues before publishing.", len(report.Issues))
+	}
+
+	utils.SendSuccess(c, http.StatusOK, message, response)
 }
 
 // PublishPackageHandler transitions a draft package to published and generates the year schedules.
