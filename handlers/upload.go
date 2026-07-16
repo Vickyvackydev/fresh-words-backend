@@ -26,20 +26,55 @@ type RollbackRequest struct {
 	PackageID string `json:"package_id" binding:"required"`
 }
 
-// UploadPackageHandler accepts a PDF/DOCX document, parses it, and creates a draft package.
+// UploadPackageHandler accepts a PDF/DOCX document, parses it, and creates or appends to a draft package.
 func UploadPackageHandler(c *gin.Context) {
 	category := c.PostForm("category")
 	yearStr := c.PostForm("year")
+	packageIDStr := c.PostForm("package_id")
 
-	if category == "" || yearStr == "" {
-		utils.SendError(c, http.StatusBadRequest, "Category and year form values are required", nil)
-		return
-	}
+	var packageID uuid.UUID
+	var isAppend bool
+	var existingPkg models.Package
+	var year int
 
-	year, err := strconv.Atoi(yearStr)
-	if err != nil || year < 2000 {
-		utils.SendError(c, http.StatusBadRequest, "Invalid year format", nil)
-		return
+	if packageIDStr != "" {
+		var err error
+		packageID, err = uuid.Parse(packageIDStr)
+		if err != nil {
+			utils.SendError(c, http.StatusBadRequest, "Invalid package_id format", err.Error())
+			return
+		}
+		
+		err = db.DB.First(&existingPkg, "id = ?", packageID).Error
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				utils.SendError(c, http.StatusNotFound, "Package not found", nil)
+				return
+			}
+			utils.SendError(c, http.StatusInternalServerError, "Database query failed", err.Error())
+			return
+		}
+
+		if existingPkg.Status != "draft" {
+			utils.SendError(c, http.StatusBadRequest, "Can only append to packages in draft status", nil)
+			return
+		}
+		isAppend = true
+		category = existingPkg.Category
+		year = existingPkg.Year
+	} else {
+		if category == "" || yearStr == "" {
+			utils.SendError(c, http.StatusBadRequest, "Category and year form values are required", nil)
+			return
+		}
+
+		var err error
+		year, err = strconv.Atoi(yearStr)
+		if err != nil || year < 2000 {
+			utils.SendError(c, http.StatusBadRequest, "Invalid year format", nil)
+			return
+		}
+		packageID = uuid.New()
 	}
 
 	fileHeader, err := c.FormFile("file")
@@ -55,7 +90,6 @@ func UploadPackageHandler(c *gin.Context) {
 		return
 	}
 
-	packageID := uuid.New()
 	fileName := fmt.Sprintf("%s_%s", packageID.String(), fileHeader.Filename)
 	filePath := filepath.Join(uploadsDir, fileName)
 
@@ -85,17 +119,36 @@ func UploadPackageHandler(c *gin.Context) {
 			uploadedAt = report.Devotionals[0].CreatedAt
 		}
 
-		pkg := models.Package{
-			ID:         packageID,
-			Category:   category,
-			Year:       year,
-			Status:     "draft",
-			FileName:   fileHeader.Filename,
-			UploadedAt: uploadedAt,
-		}
+		if isAppend {
+			// Delete overlapping days
+			var newDays []int
+			for _, d := range report.Devotionals {
+				newDays = append(newDays, d.DefaultDay)
+			}
+			if len(newDays) > 0 {
+				if err := tx.Where("package_id = ? AND default_day IN ?", packageID, newDays).
+					Delete(&models.Devotional{}).Error; err != nil {
+					return err
+				}
+			}
 
-		if err := tx.Create(&pkg).Error; err != nil {
-			return err
+			existingPkg.FileName = fmt.Sprintf("%s + %s", existingPkg.FileName, fileHeader.Filename)
+			existingPkg.UploadedAt = uploadedAt
+			if err := tx.Save(&existingPkg).Error; err != nil {
+				return err
+			}
+		} else {
+			pkg := models.Package{
+				ID:         packageID,
+				Category:   category,
+				Year:       year,
+				Status:     "draft",
+				FileName:   fileHeader.Filename,
+				UploadedAt: uploadedAt,
+			}
+			if err := tx.Create(&pkg).Error; err != nil {
+				return err
+			}
 		}
 
 		if len(report.Devotionals) > 0 {
@@ -111,9 +164,14 @@ func UploadPackageHandler(c *gin.Context) {
 		return
 	}
 
+	var totalParsed int64 = int64(report.TotalParsed)
+	if isAppend {
+		db.DB.Model(&models.Devotional{}).Where("package_id = ?", packageID).Count(&totalParsed)
+	}
+
 	response := gin.H{
 		"package_id":   packageID.String(),
-		"total_parsed": report.TotalParsed,
+		"total_parsed": totalParsed,
 		"is_valid":     report.IsValid,
 		"issues":       report.Issues,
 	}
@@ -273,3 +331,78 @@ func GetPackageHistoryHandler(c *gin.Context) {
 
 	utils.SendSuccess(c, http.StatusOK, "Package history list retrieved successfully", packages)
 }
+
+// DeletePackageHandler deletes a package and all associated devotionals, schedules, bookmarks, and reads.
+func DeletePackageHandler(c *gin.Context) {
+	packageIDStr := c.Param("id")
+	packageID, err := uuid.Parse(packageIDStr)
+	if err != nil {
+		utils.SendError(c, http.StatusBadRequest, "Invalid package ID format", err.Error())
+		return
+	}
+
+	var pkg models.Package
+	err = db.DB.First(&pkg, "id = ?", packageID).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			utils.SendError(c, http.StatusNotFound, "Package not found", nil)
+			return
+		}
+		utils.SendError(c, http.StatusInternalServerError, "Database query failed", err.Error())
+		return
+	}
+
+	// Transaction to delete package and all dependent objects to preserve database integrity
+	err = db.DB.Transaction(func(tx *gorm.DB) error {
+		// 1. Get all devotional IDs belonging to the package
+		var devoIDs []uuid.UUID
+		err := tx.Model(&models.Devotional{}).
+			Where("package_id = ?", packageID).
+			Pluck("id", &devoIDs).Error
+		if err != nil {
+			return err
+		}
+
+		if len(devoIDs) > 0 {
+			// 2. Delete devotional schedules referencing these devotionals
+			err = tx.Where("devotional_id IN ?", devoIDs).Delete(&models.DevotionalSchedule{}).Error
+			if err != nil {
+				return err
+			}
+
+			// 3. Delete user bookmarks referencing these devotionals
+			err = tx.Where("devotional_id IN ?", devoIDs).Delete(&models.UserBookmark{}).Error
+			if err != nil {
+				return err
+			}
+
+			// 4. Delete read history referencing these devotionals
+			err = tx.Where("devotional_id IN ?", devoIDs).Delete(&models.DevotionalRead{}).Error
+			if err != nil {
+				return err
+			}
+
+			// 5. Unscoped (hard) delete devotionals
+			err = tx.Unscoped().Where("package_id = ?", packageID).Delete(&models.Devotional{}).Error
+			if err != nil {
+				return err
+			}
+		}
+
+		// 6. Unscoped (hard) delete the package
+		err = tx.Unscoped().Delete(&pkg).Error
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		utils.SendError(c, http.StatusInternalServerError, "Failed to delete package and its dependencies", err.Error())
+		return
+	}
+
+	utils.SendSuccess(c, http.StatusOK, "Package and all associated data deleted successfully", nil)
+}
+

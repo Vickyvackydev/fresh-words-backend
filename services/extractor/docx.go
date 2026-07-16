@@ -2,46 +2,12 @@ package extractor
 
 import (
 	"archive/zip"
+	"bytes"
 	"encoding/xml"
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
 )
-
-// wDocument represents the root of a word/document.xml file
-type wDocument struct {
-	XMLName xml.Name `xml:"document"`
-	Body    wBody    `xml:"body"`
-}
-
-type wBody struct {
-	Paragraphs []wParagraph `xml:"p"`
-}
-
-type wParagraph struct {
-	Runs []wRun `xml:"r"`
-}
-
-type wRun struct {
-	Properties *wRunProperties `xml:"rPr"`
-	Texts      []string        `xml:"t"`
-}
-
-type wRunProperties struct {
-	Bold   *struct{} `xml:"b"`
-	Italic *struct{} `xml:"i"`
-	Size   *wSize    `xml:"sz"`
-	Font   *wFont    `xml:"rFonts"`
-}
-
-type wSize struct {
-	Val string `xml:"val,attr"`
-}
-
-type wFont struct {
-	Ascii string `xml:"ascii,attr"`
-}
 
 // ReadDocx extracts layout-aware blocks from a DOCX file without using JVM.
 func ReadDocx(path string) (*Document, error) {
@@ -71,79 +37,138 @@ func ReadDocx(path string) (*Document, error) {
 		return nil, fmt.Errorf("word/document.xml not found in DOCX zip structure")
 	}
 
-	// CRITICAL: Strip "w:" namespace prefix from tags and attributes.
-	// Go's xml.Unmarshal is namespace-aware and will ignore <w:p> unless we specify 
-	// the full OpenXML namespace on every tag. Stripping namespaces is clean, fast, and works instantly.
-	xmlStr := string(docXML)
-	xmlStr = strings.ReplaceAll(xmlStr, "<w:", "<")
-	xmlStr = strings.ReplaceAll(xmlStr, "</w:", "</")
-	xmlStr = strings.ReplaceAll(xmlStr, " w:", " ")
-	docXML = []byte(xmlStr)
-
-	var wDoc wDocument
-	if err := xml.Unmarshal(docXML, &wDoc); err != nil {
-		return nil, fmt.Errorf("failed to parse DOCX XML: %w", err)
-	}
+	decoder := xml.NewDecoder(bytes.NewReader(docXML))
 
 	result := &Document{}
 	page := Page{Number: 1}
 	currentY := 0.0
 
-	for _, p := range wDoc.Body.Paragraphs {
-		var block Block
-		var currentLine Line
-		currentX := 0.0
+	type xmlParagraph struct {
+		words []Word
+	}
 
-		for _, r := range p.Runs {
-			fontName := ""
-			fontSize := 11.0
-			isBold := false
-			isItalic := false
+	var currentParagraph *xmlParagraph
 
-			if r.Properties != nil {
-				if r.Properties.Font != nil {
-					fontName = r.Properties.Font.Ascii
+	// Keep track of active run properties
+	var currentFont string
+	var currentSize float64 = 11.0
+	var isBold bool
+	var isItalic bool
+
+	inRun := false
+	inText := false
+	inRPr := false
+
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode XML sequentially: %w", err)
+		}
+
+		switch se := token.(type) {
+		case xml.StartElement:
+			localName := se.Name.Local
+			switch localName {
+			case "p":
+				currentParagraph = &xmlParagraph{}
+			case "r":
+				inRun = true
+				currentFont = ""
+				currentSize = 11.0
+				isBold = false
+				isItalic = false
+			case "rPr":
+				inRPr = true
+			case "b":
+				if inRPr {
+					isBold = true
 				}
-				if r.Properties.Size != nil {
-					if sz, err := strconv.ParseFloat(r.Properties.Size.Val, 64); err == nil {
-						fontSize = sz / 2.0
+			case "i":
+				if inRPr {
+					isItalic = true
+				}
+			case "sz":
+				if inRPr {
+					for _, attr := range se.Attr {
+						if attr.Name.Local == "val" {
+							var val float64
+							if _, err := fmt.Sscanf(attr.Value, "%f", &val); err == nil {
+								currentSize = val / 2.0
+							}
+						}
 					}
 				}
-				isBold = r.Properties.Bold != nil
-				isItalic = r.Properties.Italic != nil
+			case "rFonts":
+				if inRPr {
+					for _, attr := range se.Attr {
+						if attr.Name.Local == "ascii" {
+							currentFont = attr.Value
+						}
+					}
+				}
+			case "t":
+				if inRun {
+					inText = true
+				}
 			}
 
-			for _, t := range r.Texts {
-				tokens := strings.Split(t, " ")
-				for i, token := range tokens {
-					if token == "" && i != len(tokens)-1 {
+		case xml.EndElement:
+			localName := se.Name.Local
+			switch localName {
+			case "p":
+				if currentParagraph != nil {
+					// We finished a paragraph. If it has words, wrap it into a Block/Line
+					if len(currentParagraph.words) > 0 {
+						var block Block
+						var currentLine Line
+						currentX := 0.0
+						for _, w := range currentParagraph.words {
+							w.X = currentX
+							w.Y = currentY
+							currentLine.Words = append(currentLine.Words, w)
+							currentX += w.Width + (w.FontSize * 0.5)
+						}
+						block.Lines = append(block.Lines, currentLine)
+						page.Blocks = append(page.Blocks, block)
+						currentY += 15.0
+					}
+					currentParagraph = nil
+				}
+			case "r":
+				inRun = false
+			case "rPr":
+				inRPr = false
+			case "t":
+				inText = false
+			}
+
+		case xml.CharData:
+			if inText && currentParagraph != nil && inRun {
+				textVal := string(se)
+				// Split into words by spaces (retaining the logic from original ReadDocx)
+				tokens := strings.Split(textVal, " ")
+				for i, tokenStr := range tokens {
+					if tokenStr == "" && i != len(tokens)-1 {
 						continue
 					}
-
-					if token != "" {
+					if tokenStr != "" {
 						word := Word{
-							Text:     token,
-							X:        currentX,
-							Y:        currentY,
-							Width:    float64(len(token)) * (fontSize * 0.5),
-							Height:   fontSize,
+							Text:     tokenStr,
+							Width:    float64(len(tokenStr)) * (currentSize * 0.5),
+							Height:   currentSize,
 							Page:     1,
-							FontName: fontName,
-							FontSize: fontSize,
+							FontName: currentFont,
+							FontSize: currentSize,
 							IsBold:   isBold,
 							IsItalic: isItalic,
 						}
-						currentLine.Words = append(currentLine.Words, word)
-						currentX += word.Width + (fontSize * 0.5)
+						currentParagraph.words = append(currentParagraph.words, word)
 					}
 				}
 			}
-		}
-
-		if len(currentLine.Words) > 0 {
-			block.Lines = append(block.Lines, currentLine)
-			page.Blocks = append(page.Blocks, block)
-			currentY += 15.0
 		}
 	}
 
@@ -151,3 +176,4 @@ func ReadDocx(path string) (*Document, error) {
 	result.Pages = append(result.Pages, page)
 	return result, nil
 }
+

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -101,15 +102,23 @@ func extractDevotionals(doc *typography.SemanticDocument, category string, year 
 				report.Devotionals = append(report.Devotionals, *currentDevo)
 			}
 
+			targetDay := dayCounter
+			parsedDay, err := parseDayFromDateString(text, year)
+			if err == nil && parsedDay > 0 {
+				targetDay = parsedDay
+				dayCounter = parsedDay + 1
+			} else {
+				dayCounter++
+			}
+
 			currentDevo = &models.Devotional{
 				ID:         uuid.New(),
 				PackageID:  packageID,
 				Category:   category,
-				DefaultDay: dayCounter,
+				DefaultDay: targetDay,
 				CreatedAt:  time.Now(),
 				UpdatedAt:  time.Now(),
 			}
-			dayCounter++
 			currentSection = "Date"
 			continue
 		}
@@ -124,8 +133,15 @@ func extractDevotionals(doc *typography.SemanticDocument, category string, year 
 
 			// If it's a heading right after Date, it's ALWAYS the Title
 			if currentSection == "Date" {
-				currentDevo.Title = text
-				currentSection = "Title"
+				ref, quote, found := extractScripture(text)
+				if found {
+					currentDevo.Title = quote
+					currentDevo.ScriptureReference = ref
+					currentSection = "ScriptureQuote"
+				} else {
+					currentDevo.Title = text
+					currentSection = "Title"
+				}
 				continue
 			}
 
@@ -158,9 +174,20 @@ func extractDevotionals(doc *typography.SemanticDocument, category string, year 
 				continue
 			}
 
-			// If it's a heading block during Title state, append it to Title (multi-line title)
+			// If it's a heading block during Title state, check if it is a scripture reference
 			if currentSection == "Title" {
-				currentDevo.Title += " " + text
+				ref, quote, found := extractScripture(text)
+				if found {
+					currentDevo.ScriptureReference = ref
+					if quote != "" {
+						currentDevo.ScriptureQuote = quote
+						currentSection = "Body"
+					} else {
+						currentSection = "ScriptureQuote"
+					}
+				} else {
+					currentDevo.Title += " " + text
+				}
 				continue
 			}
 
@@ -169,7 +196,7 @@ func extractDevotionals(doc *typography.SemanticDocument, category string, year 
 			if currentDevo.Body != "" {
 				currentDevo.Body += "\n\n"
 			}
-			currentDevo.Body += "**" + text + "**"
+			currentDevo.Body += text
 			continue
 		}
 
@@ -253,11 +280,11 @@ func isScriptureReference(text string) bool {
 
 func extractScripture(text string) (ref string, quote string, found bool) {
 	// Match book, chapter and verse (e.g. Luke 18:1, 1 Corinthians 13:4-8, Psalm 68:9)
-	re := regexp.MustCompile(`\(?((?:[1-9]\s+)?[A-Za-z]+(?:\s+[A-Za-z]+)*\s+\d+:\d+(?:-\d+)?)\)?`)
+	re := regexp.MustCompile(`\(?((?:[1-9]\s+)?[A-Za-z]+(?:\s+[A-Za-z]+)*\s+\d+:\d+(?:\s*[-–—]\s*\d+)?)\)?`)
 	loc := re.FindStringSubmatchIndex(text)
 	if loc == nil {
-		// Fallback to match book and chapter only (e.g. "1 Chronicles 29")
-		reNoVerse := regexp.MustCompile(`\(?((?:[1-9]\s+)?[A-Za-z]+(?:\s+[A-Za-z]+)*\s+\d+)\)?`)
+		// Fallback to match book and chapter only (e.g. "1 Chronicles 29-30")
+		reNoVerse := regexp.MustCompile(`\(?((?:[1-9]\s+)?[A-Za-z]+(?:\s+[A-Za-z]+)*\s+\d+(?:\s*[-–—]\s*\d+)?)\)?`)
 		loc = reNoVerse.FindStringSubmatchIndex(text)
 		if loc == nil {
 			return "", "", false
@@ -274,4 +301,47 @@ func extractScripture(text string) (ref string, quote string, found bool) {
 	rawQuote = strings.TrimSpace(rawQuote)
 
 	return ref, rawQuote, true
+}
+
+func parseDayFromDateString(text string, year int) (int, error) {
+	upper := strings.ToUpper(strings.TrimSpace(text))
+	
+	if strings.HasPrefix(upper, "DAY") {
+		var dayNum int
+		_, err := fmt.Sscanf(upper, "DAY %d", &dayNum)
+		if err == nil {
+			return dayNum, nil
+		}
+	}
+
+	months := map[string]time.Month{
+		"JANUARY": time.January, "JAN": time.January,
+		"FEBRUARY": time.February, "FEB": time.February,
+		"MARCH": time.March, "MAR": time.March,
+		"APRIL": time.April, "APR": time.April,
+		"MAY": time.May,
+		"JUNE": time.June, "JUN": time.June,
+		"JULY": time.July, "JUL": time.July,
+		"AUGUST": time.August, "AUG": time.August,
+		"SEPTEMBER": time.September, "SEP": time.September,
+		"OCTOBER": time.October, "OCT": time.October,
+		"NOVEMBER": time.November, "NOV": time.November,
+		"DECEMBER": time.December, "DEC": time.December,
+	}
+
+	re := regexp.MustCompile(`^([A-Z]+)\s+(\d+)`)
+	matches := re.FindStringSubmatch(upper)
+	if len(matches) == 3 {
+		monthStr := matches[1]
+		dayStr := matches[2]
+		
+		if month, ok := months[monthStr]; ok {
+			dayNum, err := strconv.Atoi(dayStr)
+			if err == nil {
+				t := time.Date(year, month, dayNum, 0, 0, 0, 0, time.UTC)
+				return t.YearDay(), nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("could not parse date")
 }

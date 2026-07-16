@@ -32,6 +32,9 @@ type Settings struct {
 	YearlyDevotionalTime      string `gorm:"type:varchar(10);not null;default:'08:00 AM'" json:"yearly_devotional_time"`
 	YearlyDevotionalRandomize bool   `gorm:"type:boolean;not null;default:false" json:"yearly_devotional_randomize"`
 
+	DailyQuoteText    string         `gorm:"type:text;not null;default:'Now faith is the assurance of things hoped for, the conviction of things not seen.'" json:"daily_quote_text"`
+	DailyQuoteAuthor  string         `gorm:"type:varchar(255);not null;default:'Hebrews 11:1'" json:"daily_quote_author"`
+
 	CreatedAt         time.Time      `json:"created_at"`
 	UpdatedAt         time.Time      `json:"updated_at"`
 	DeletedAt         gorm.DeletedAt `gorm:"index" json:"-"`

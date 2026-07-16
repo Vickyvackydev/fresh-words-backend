@@ -104,8 +104,9 @@ func registerRoutes(r *gin.Engine) {
 		api.GET("/devotionals/today", handlers.GetTodayDevotionalHandler)
 		api.GET("/devotionals/date", handlers.GetDevotionalByDateHandler)
 		api.GET("/devotionals/calendar", handlers.GetCalendarDevotionalsHandler)
-		api.POST("/feedback", handlers.SubmitFeedbackHandler)
+		api.GET("/packages/active", handlers.GetActivePackageDevotionalsHandler)
 		api.GET("/settings", handlers.GetSettingsHandler)
+		api.POST("/feedback", handlers.SubmitFeedbackHandler)
 		api.GET("/bookmarks", handlers.GetBookmarksHandler)
 		api.POST("/bookmarks", handlers.ToggleBookmarkHandler)
 		api.POST("/devotionals/read", handlers.RecordDevotionalReadHandler)
@@ -131,6 +132,10 @@ func registerRoutes(r *gin.Engine) {
 			admin.POST("/packages/publish", handlers.PublishPackageHandler)
 			admin.POST("/packages/rollback", handlers.RollbackPackageHandler)
 			admin.GET("/packages/history", handlers.GetPackageHistoryHandler)
+			admin.DELETE("/packages/:id", handlers.DeletePackageHandler)
+
+			// Devotional Operations
+			admin.PUT("/devotionals/:id", handlers.UpdateDevotionalHandler)
 		}
 	}
 }

@@ -16,14 +16,12 @@ func Reconstruct(doc *extractor.Document) (*extractor.Document, error) {
 		return nil, fmt.Errorf("cannot reconstruct a nil document")
 	}
 
-	if doc.IsLinear {
-		// Linear documents (like DOCX) already have native paragraph structure.
-		// Bypassing visual layout merging prevents merging paragraphs together.
-		return doc, nil
+	if !doc.IsLinear {
+		doc = removeHeadersAndFooters(doc)
+		doc = mergeLinesIntoParagraphs(doc)
 	}
 
-	doc = removeHeadersAndFooters(doc)
-	doc = mergeLinesIntoParagraphs(doc)
+	doc = mergeDropCaps(doc)
 
 	return doc, nil
 }
@@ -214,3 +212,76 @@ func isHeadingLine(text string) bool {
 
 	return false
 }
+
+// mergeDropCaps detects single-character uppercase blocks followed by a lowercase-starting paragraph and merges them.
+func mergeDropCaps(doc *extractor.Document) *extractor.Document {
+	for i, page := range doc.Pages {
+		var cleanedBlocks []extractor.Block
+		for j := 0; j < len(page.Blocks); j++ {
+			block := page.Blocks[j]
+			blockText := getBlockText(block)
+			
+			// Detect drop cap: length 1, uppercase letter
+			if len(blockText) == 1 && blockText >= "A" && blockText <= "Z" && j < len(page.Blocks)-1 {
+				nextBlock := page.Blocks[j+1]
+				nextText := getBlockText(nextBlock)
+				
+				// Check if next block starts with a lowercase letter
+				if len(nextText) > 0 && nextText[0] >= 'a' && nextText[0] <= 'z' {
+					// We found a drop cap! Merge them!
+					mergedBlock := mergeTwoBlocks(block, nextBlock, blockText)
+					page.Blocks[j+1] = mergedBlock
+					continue // skip the current single-character block
+				}
+			}
+			cleanedBlocks = append(cleanedBlocks, block)
+		}
+		doc.Pages[i].Blocks = cleanedBlocks
+	}
+	return doc
+}
+
+func getBlockText(block extractor.Block) string {
+	var lines []string
+	for _, line := range block.Lines {
+		lines = append(lines, getLineText(line))
+	}
+	return strings.Join(lines, " ")
+}
+
+func mergeTwoBlocks(dropCapBlock, mainBlock extractor.Block, dropCapText string) extractor.Block {
+	if len(mainBlock.Lines) == 0 {
+		return dropCapBlock
+	}
+	
+	firstLine := mainBlock.Lines[0]
+	if len(firstLine.Words) == 0 {
+		return mainBlock
+	}
+	
+	firstWordText := firstLine.Words[0].Text
+	needSpace := false
+	if dropCapText == "I" {
+		needSpace = true
+	} else if dropCapText == "A" {
+		directMerges := map[string]bool{
+			"nd": true, "s": true, "t": true, "fter": true, "ll": true, 
+			"lthough": true, "bout": true, "gainst": true, "n": true, "re": true,
+		}
+		if !directMerges[firstWordText] {
+			needSpace = true
+		}
+	}
+	
+	if needSpace {
+		newWords := append([]extractor.Word{dropCapBlock.Lines[0].Words[0]}, firstLine.Words...)
+		mainBlock.Lines[0].Words = newWords
+	} else {
+		firstLine.Words[0].Text = dropCapText + firstWordText
+		firstLine.Words[0].IsBold = false // clean standard style
+	}
+	
+	mainBlock.Lines[0] = firstLine
+	return mainBlock
+}
+

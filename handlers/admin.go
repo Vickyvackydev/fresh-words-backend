@@ -38,6 +38,9 @@ type SettingsUpdateRequest struct {
 	YearlyDevotionalEnabled   *bool  `json:"yearly_devotional_enabled"`
 	YearlyDevotionalTime      string `json:"yearly_devotional_time"`
 	YearlyDevotionalRandomize *bool  `json:"yearly_devotional_randomize"`
+
+	DailyQuoteText    string `json:"daily_quote_text"`
+	DailyQuoteAuthor  string `json:"daily_quote_author"`
 }
 
 // GetDashboardStatsHandler returns count statistics for the admin control panel.
@@ -243,6 +246,9 @@ func GetSettingsHandler(c *gin.Context) {
 				YearlyDevotionalEnabled:   true,
 				YearlyDevotionalTime:      "08:00 AM",
 				YearlyDevotionalRandomize: false,
+
+				DailyQuoteText:    "Now faith is the assurance of things hoped for, the conviction of things not seen.",
+				DailyQuoteAuthor:  "Hebrews 11:1",
 			}
 			if createErr := db.DB.Create(&settings).Error; createErr != nil {
 				utils.SendError(c, http.StatusInternalServerError, "Failed to seed default settings", createErr.Error())
@@ -318,6 +324,13 @@ func UpdateSettingsHandler(c *gin.Context) {
 	}
 	if req.YearlyDevotionalRandomize != nil {
 		settings.YearlyDevotionalRandomize = *req.YearlyDevotionalRandomize
+	}
+
+	if req.DailyQuoteText != "" {
+		settings.DailyQuoteText = req.DailyQuoteText
+	}
+	if req.DailyQuoteAuthor != "" {
+		settings.DailyQuoteAuthor = req.DailyQuoteAuthor
 	}
 
 	var saveErr error

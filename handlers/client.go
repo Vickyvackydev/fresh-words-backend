@@ -231,3 +231,32 @@ func RecordDevotionalReadHandler(c *gin.Context) {
 
 	utils.SendSuccess(c, http.StatusCreated, "Read logged successfully", nil)
 }
+
+// GetActivePackageDevotionalsHandler returns all devotionals in the active published package for a category.
+func GetActivePackageDevotionalsHandler(c *gin.Context) {
+	category := c.Query("category")
+	if category == "" {
+		utils.SendError(c, http.StatusBadRequest, "Category parameter is required", nil)
+		return
+	}
+
+	var pkg models.Package
+	err := db.DB.Where("category = ? AND status = ?", category, "published").First(&pkg).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			utils.SendError(c, http.StatusNotFound, "No active published package found for this category", nil)
+			return
+		}
+		utils.SendError(c, http.StatusInternalServerError, "Database query failed", err.Error())
+		return
+	}
+
+	var devotionals []models.Devotional
+	err = db.DB.Where("package_id = ?", pkg.ID).Order("default_day asc").Find(&devotionals).Error
+	if err != nil {
+		utils.SendError(c, http.StatusInternalServerError, "Failed to load devotionals", err.Error())
+		return
+	}
+
+	utils.SendSuccess(c, http.StatusOK, "Active package devotionals retrieved successfully", devotionals)
+}
