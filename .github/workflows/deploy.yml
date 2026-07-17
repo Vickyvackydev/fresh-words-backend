@@ -23,6 +23,18 @@ jobs:
         run: |
           env GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o fresh-words-server cmd/server/main.go
 
+      - name: Prepare server for upload (Unlink running binary)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DROPLET_IP }}
+          username: ${{ secrets.DROPLET_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            if [ -f /var/www/fresh-words-backend/fresh-words-server ]; then
+              mv /var/www/fresh-words-backend/fresh-words-server /var/www/fresh-words-backend/fresh-words-server.old
+            fi
+
       - name: Copy Binary via SCP
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -43,3 +55,4 @@ jobs:
           port: 22
           script: |
             sudo systemctl restart fresh-words
+            rm -f /var/www/fresh-words-backend/fresh-words-server.old
