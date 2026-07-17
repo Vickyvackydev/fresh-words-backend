@@ -227,8 +227,8 @@ func GetSettingsHandler(c *gin.Context) {
 			settings = models.Settings{
 				ChurchName:        "Fresh Words Devotional",
 				SupportEmail:      "info@freshwords.org",
-				PrivacyPolicyURL:  "https://freshwords.org/privacy",
-				TermsOfServiceURL: "https://freshwords.org/terms",
+				PrivacyPolicyURL:  "https://freshdevotionals.com/privacy",
+				TermsOfServiceURL: "https://freshdevotionals.com/terms",
 				AboutUs:           "Growing with God every single day. Daily deliverance, holiness, prayer and yearly devotionals.",
 				
 				DailyDeliveranceEnabled:   true,
