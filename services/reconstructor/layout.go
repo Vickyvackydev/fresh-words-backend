@@ -72,15 +72,28 @@ func mergeLinesIntoParagraphs(doc *extractor.Document) *extractor.Document {
 		var currentBlock *extractor.Block
 		var lastLine *extractor.Line
 
+		// Compute page right margin for short-line detection
+		pageRightMargin := 0.0
+		for _, physicalBlock := range page.Blocks {
+			for _, line := range physicalBlock.Lines {
+				if len(line.Words) > 0 {
+					re := line.Words[len(line.Words)-1].X + line.Words[len(line.Words)-1].Width
+					if re > pageRightMargin {
+						pageRightMargin = re
+					}
+				}
+			}
+		}
+
 		for _, physicalBlock := range page.Blocks {
 			for _, line := range physicalBlock.Lines {
 				lineText := getLineText(line)
 
 				// CRITICAL: If a line starts with a Date or a Heading, we MUST force a block split.
-				if isDateOrDay(lineText) || isHeadingLine(lineText) {
+				if isDateStart(lineText) || isHeadingLine(lineText) {
 					// BUT wait! If the previous line was ALSO a heading, we are continuing the SAME heading block
 					// (e.g. a multi-line title like "GIFTED BUT NOT" / "LIFTED"). We should merge them!
-					if lastLine != nil && isHeadingLine(getLineText(*lastLine)) && !isDateOrDay(lineText) {
+					if lastLine != nil && isHeadingLine(getLineText(*lastLine)) && !isDateStart(lineText) {
 						currentBlock.Lines = append(currentBlock.Lines, line)
 						lastLine = &line
 						continue
@@ -120,7 +133,23 @@ func mergeLinesIntoParagraphs(doc *extractor.Document) *extractor.Document {
 				gap := math.Abs(line.Words[0].Y - lastLine.Words[0].Y)
 				avgHeight := (line.Words[0].FontSize + lastLine.Words[0].FontSize) / 2.0
 
-				if gap > avgHeight*1.5 {
+				lastLineRightEdge := 0.0
+				if len(lastLine.Words) > 0 {
+					lastLineRightEdge = lastLine.Words[len(lastLine.Words)-1].X + lastLine.Words[len(lastLine.Words)-1].Width
+				}
+
+				isShortLine := false
+				if pageRightMargin > 0 && (pageRightMargin-lastLineRightEdge) > 70.0 {
+					isShortLine = true
+				}
+
+				indentX := 0.0
+				if len(line.Words) > 0 && len(lastLine.Words) > 0 {
+					indentX = line.Words[0].X - lastLine.Words[0].X
+				}
+
+				// Split block if there is a large gap, significant indentation, or if the previous line ended early (indicating a paragraph end)
+				if gap > avgHeight*1.4 || indentX > avgHeight*1.5 || (isShortLine && gap > avgHeight*1.0) {
 					if currentBlock != nil && len(currentBlock.Lines) > 0 {
 						logicalBlocks = append(logicalBlocks, *currentBlock)
 					}
@@ -168,8 +197,19 @@ func isPageNumber(s string) bool {
 
 func isDateOrDay(text string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(text))
-	re := regexp.MustCompile(`^(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER|JAN|FEB|MAR|APR|JUN|JUL|AUG|SEP|OCT|NOV|DEC|DAY)\s+\d{1,2}`)
+	re := regexp.MustCompile(`(?i)^(?:DAY\s+\d{1,3}|(?:JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER|JAN|FEB|MAR|APR|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{1,2}(?:ST|ND|RD|TH)?|\d{1,2}(?:ST|ND|RD|TH)?\s+(?:JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER|JAN|FEB|MAR|APR|JUN|JUL|AUG|SEP|OCT|NOV|DEC))\b`)
 	return re.MatchString(upper)
+}
+
+func isDateStart(text string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(text))
+	if upper == "DAY" {
+		return true
+	}
+	if isMonthName(text) {
+		return true
+	}
+	return isDateOrDay(text)
 }
 
 func isMonthName(text string) bool {
@@ -191,7 +231,12 @@ func isHeadingLine(text string) bool {
 	upper := strings.ToUpper(trimmed)
 
 	// Check if it's one of our known headings
-	headings := []string{"PRAYER", "CONFESSION", "FURTHER READING", "MEMORY VERSE", "KEY POINT", "DECLARATION", "ACTION POINT", "REFLECTION"}
+	headings := []string{
+		"PRAYER", "CONFESSION", "FURTHER READING", "MEMORY VERSE", 
+		"KEY POINT", "DECLARATION", "ACTION POINT", "REFLECTION",
+		"MESSAGE", "BODY", "SCRIPTURE READING", "BIBLE READING", 
+		"BIBLE TEXT", "SCRIPTURE LESSON",
+	}
 	for _, h := range headings {
 		if strings.HasPrefix(upper, h) {
 			return true
@@ -213,27 +258,30 @@ func isHeadingLine(text string) bool {
 	return false
 }
 
-// mergeDropCaps detects single-character uppercase blocks followed by a lowercase-starting paragraph and merges them.
+// mergeDropCaps detects single-character uppercase blocks/words and merges them cleanly into paragraphs.
 func mergeDropCaps(doc *extractor.Document) *extractor.Document {
 	for i, page := range doc.Pages {
 		var cleanedBlocks []extractor.Block
 		for j := 0; j < len(page.Blocks); j++ {
 			block := page.Blocks[j]
-			blockText := getBlockText(block)
+			blockText := strings.TrimSpace(getBlockText(block))
 			
-			// Detect drop cap: length 1, uppercase letter
+			// Detect drop cap: length 1, uppercase letter as separate block
 			if len(blockText) == 1 && blockText >= "A" && blockText <= "Z" && j < len(page.Blocks)-1 {
 				nextBlock := page.Blocks[j+1]
-				nextText := getBlockText(nextBlock)
+				nextText := strings.TrimSpace(getBlockText(nextBlock))
 				
 				// Check if next block starts with a lowercase letter
 				if len(nextText) > 0 && nextText[0] >= 'a' && nextText[0] <= 'z' {
-					// We found a drop cap! Merge them!
+					// Merge separate single-character block into next block
 					mergedBlock := mergeTwoBlocks(block, nextBlock, blockText)
-					page.Blocks[j+1] = mergedBlock
+					page.Blocks[j+1] = fixMisplacedDropCapsInBlock(mergedBlock)
 					continue // skip the current single-character block
 				}
 			}
+
+			// Clean any inline misplaced drop-caps in this block
+			block = fixMisplacedDropCapsInBlock(block)
 			cleanedBlocks = append(cleanedBlocks, block)
 		}
 		doc.Pages[i].Blocks = cleanedBlocks
@@ -283,5 +331,89 @@ func mergeTwoBlocks(dropCapBlock, mainBlock extractor.Block, dropCapText string)
 	
 	mainBlock.Lines[0] = firstLine
 	return mainBlock
+}
+
+// fixMisplacedDropCapsInBlock fixes inline drop-caps that land at line start or floating inside early sentence text.
+func fixMisplacedDropCapsInBlock(block extractor.Block) extractor.Block {
+	if len(block.Lines) == 0 || len(block.Lines[0].Words) == 0 {
+		return block
+	}
+
+	// 1. Check if first line starts with a single uppercase letter word followed by a lowercase word (e.g. ["T", "he"])
+	if len(block.Lines[0].Words) >= 2 {
+		w0 := block.Lines[0].Words[0].Text
+		w1 := block.Lines[0].Words[1].Text
+
+		if len(w0) == 1 && w0 >= "A" && w0 <= "Z" && len(w1) > 0 && w1[0] >= 'a' && w1[0] <= 'z' {
+			if w0 == "I" || (w0 == "A" && w1 != "nd" && w1 != "fter" && w1 != "bout" && w1 != "gainst") {
+				// Keep space (e.g. "I have", "A man")
+			} else {
+				// Direct merge (e.g. "T" + "he" -> "The")
+				block.Lines[0].Words[0].Text = w0 + w1
+				block.Lines[0].Words = append(block.Lines[0].Words[:1], block.Lines[0].Words[2:]...)
+			}
+		}
+	}
+
+	// 2. Check if paragraph starts with a lowercase letter and contains an orphaned capital letter in early lines
+	firstText := strings.TrimSpace(getBlockText(block))
+	if len(firstText) > 0 && firstText[0] >= 'a' && firstText[0] <= 'z' {
+		// Find an isolated uppercase letter in the early words of the block
+		var dropCapChar string
+		var foundLineIdx, foundWordIdx int = -1, -1
+
+		for lIdx, line := range block.Lines {
+			if lIdx > 5 { // search up to first 6 lines for the drop cap
+				break
+			}
+			for wIdx, w := range line.Words {
+				if lIdx == 0 && wIdx == 0 {
+					continue
+				}
+				// Isolated single uppercase letter (e.g. "T")
+				if len(w.Text) == 1 && w.Text >= "A" && w.Text <= "Z" {
+					// If we find one that is significantly larger, we are sure it's the drop cap
+					if len(block.Lines) > 0 && len(block.Lines[0].Words) > 0 {
+						if w.FontSize > block.Lines[0].Words[0].FontSize*1.3 {
+							dropCapChar = w.Text
+							foundLineIdx = lIdx
+							foundWordIdx = wIdx
+							break
+						}
+					}
+					// Otherwise, save it as a fallback if we haven't found any yet
+					if dropCapChar == "" {
+						dropCapChar = w.Text
+						foundLineIdx = lIdx
+						foundWordIdx = wIdx
+					}
+				}
+			}
+			if dropCapChar != "" && len(block.Lines) > 0 && len(block.Lines[0].Words) > 0 && block.Lines[foundLineIdx].Words[foundWordIdx].FontSize > block.Lines[0].Words[0].FontSize*1.3 {
+				break // Found a large one, stop searching
+			}
+		}
+
+		if dropCapChar != "" && foundLineIdx >= 0 && foundWordIdx >= 0 {
+			// Remove the orphaned drop-cap word from its current line
+			line := block.Lines[foundLineIdx]
+			if foundWordIdx < len(line.Words) {
+				line.Words = append(line.Words[:foundWordIdx], line.Words[foundWordIdx+1:]...)
+				block.Lines[foundLineIdx] = line
+			}
+
+			// Merge the drop-cap character into the very first word of the block
+			if len(block.Lines) > 0 && len(block.Lines[0].Words) > 0 {
+				firstW := block.Lines[0].Words[0].Text
+				if dropCapChar == "I" || (dropCapChar == "A" && firstW != "nd" && firstW != "fter") {
+					block.Lines[0].Words = append([]extractor.Word{{Text: dropCapChar}}, block.Lines[0].Words...)
+				} else {
+					block.Lines[0].Words[0].Text = dropCapChar + firstW
+				}
+			}
+		}
+	}
+
+	return block
 }
 

@@ -41,14 +41,19 @@ func ReadPdf(path string) (*Document, error) {
 		
 		// CRITICAL: Sort words top-to-bottom (Y descending), then left-to-right (X ascending)
 		// ledongthuc/pdf returns characters in random drawing order, so we must sort them to get reading order.
+		// Using TopY (Y + FontSize * 0.8) accounts for font ascenders and prevents large drop caps from overshooting to the previous line.
 		sort.Slice(words, func(a, b int) bool {
-			// Y=0 is bottom of page in PDF coordinates, so higher Y means higher on page.
-			// If Y is roughly the same (within half of font size), sort left-to-right (X ascending)
-			if math.Abs(words[a].Y-words[b].Y) < words[a].FontSize*0.5 {
+			topA := words[a].Y + words[a].FontSize*0.8
+			topB := words[b].Y + words[b].FontSize*0.8
+			minFont := math.Min(words[a].FontSize, words[b].FontSize)
+
+			// If they are roughly on the same horizontal line
+			if math.Abs(topA-topB) < minFont*0.8 {
 				return words[a].X < words[b].X
 			}
-			// Otherwise sort top-to-bottom (Y descending)
-			return words[a].Y > words[b].Y
+			
+			// Otherwise sort top-to-bottom
+			return topA > topB
 		})
 
 		lines := groupWordsIntoLines(words)
@@ -86,7 +91,7 @@ func groupTextsIntoWords(texts []pdf.Text, pageNum int) []Word {
 		if wordText.Len() > 0 {
 			if math.Abs(currentWord.Y-c.Y) < fontSize*0.5 {
 				gap := c.X - (currentWord.X + currentWord.Width)
-				if gap > (fontSize * 0.25) {
+				if gap > (fontSize*0.25) || gap < -0.1 {
 					currentWord.Text = wordText.String()
 					words = append(words, currentWord)
 					wordText.Reset()
@@ -123,7 +128,7 @@ func groupTextsIntoWords(texts []pdf.Text, pageNum int) []Word {
 	return words
 }
 
-// groupWordsIntoLines groups words that fall on the same horizontal baseline.
+// groupWordsIntoLines groups words that fall on the same horizontal baseline (now using TopY).
 func groupWordsIntoLines(words []Word) []Line {
 	var lines []Line
 	if len(words) == 0 {
@@ -131,17 +136,26 @@ func groupWordsIntoLines(words []Word) []Line {
 	}
 
 	var currentLine Line
-	lastY := words[0].Y
+	var lineTopY float64
 
 	for _, w := range words {
-		if math.Abs(w.Y-lastY) > w.FontSize*0.5 {
-			if len(currentLine.Words) > 0 {
-				lines = append(lines, currentLine)
-			}
+		topY := w.Y + w.FontSize*0.8
+
+		var isSameLine bool
+		if len(currentLine.Words) == 0 {
+			isSameLine = true
+			lineTopY = topY
+		} else {
+			minFont := math.Min(w.FontSize, currentLine.Words[0].FontSize)
+			isSameLine = math.Abs(topY-lineTopY) < minFont*0.8
+		}
+
+		if !isSameLine {
+			lines = append(lines, currentLine)
 			currentLine = Line{}
+			lineTopY = topY
 		}
 		currentLine.Words = append(currentLine.Words, w)
-		lastY = w.Y
 	}
 
 	if len(currentLine.Words) > 0 {

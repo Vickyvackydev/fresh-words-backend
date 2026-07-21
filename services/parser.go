@@ -13,6 +13,7 @@ import (
 	"fresh-words-backend/services/normalizer"
 	"fresh-words-backend/services/reconstructor"
 	"fresh-words-backend/services/typography"
+
 	"github.com/google/uuid"
 )
 
@@ -77,10 +78,10 @@ func extractDevotionals(doc *typography.SemanticDocument, category string, year 
 		IsValid: true,
 	}
 
-	var currentDevo *models.Devotional
-	var currentSection string
-	var dayCounter int = 1
+	var chunks [][]typography.SemanticBlock
+	var currentChunk []typography.SemanticBlock
 
+	// 1. Chunking: split the document by "DAY X" boundaries
 	for i := 0; i < len(doc.Blocks); i++ {
 		block := doc.Blocks[i]
 		text := strings.TrimSpace(block.Text)
@@ -90,167 +91,66 @@ func extractDevotionals(doc *typography.SemanticDocument, category string, year 
 		}
 
 		isDate := isDateOrDay(text)
-		log.Printf("[PARSER] Evaluating Block - Type: %v, Length: %d, IsDate: %v | Text: %q\n", block.Type, len(text), isDate, text)
+		var mergedText string
+		skipNext := false
 
-		// E.g., "JANUARY 4" or "Day 4"
-		// If it looks like a date and it's short, treat it as the start of a Devotional.
-		// We relax the TypeHeading requirement because some PDFs have dates formatted identically to body text.
-		if isDate && len(text) < 150 {
-			log.Printf("[PARSER] --> NEW DEVOTIONAL BOUNDARY FOUND: %s\n", text)
-			// Save the previous devotional
-			if currentDevo != nil {
-				report.Devotionals = append(report.Devotionals, *currentDevo)
+		// Check if it's a split date (e.g. "June" in one block, "4" in the next)
+		if !isDate && (isMonthName(text) || strings.ToUpper(text) == "DAY") {
+			if i+1 < len(doc.Blocks) {
+				nextText := strings.TrimSpace(doc.Blocks[i+1].Text)
+				if isStandaloneDayNumber(nextText) {
+					isDate = true
+					mergedText = text + " " + nextText
+					skipNext = true
+				}
 			}
+		}
 
-			targetDay := dayCounter
-			parsedDay, err := parseDayFromDateString(text, year)
-			if err == nil && parsedDay > 0 {
-				targetDay = parsedDay
-				dayCounter = parsedDay + 1
+		if isDate && (len(text) < 150 || len(mergedText) > 0) {
+			if len(currentChunk) > 0 {
+				chunks = append(chunks, currentChunk)
+			}
+			
+			if skipNext {
+				combinedBlock := block
+				combinedBlock.Text = mergedText
+				currentChunk = []typography.SemanticBlock{combinedBlock}
+				i++ // skip the next block
 			} else {
-				dayCounter++
+				currentChunk = []typography.SemanticBlock{block}
 			}
-
-			currentDevo = &models.Devotional{
-				ID:         uuid.New(),
-				PackageID:  packageID,
-				Category:   category,
-				DefaultDay: targetDay,
-				CreatedAt:  time.Now(),
-				UpdatedAt:  time.Now(),
+		} else {
+			if len(currentChunk) > 0 {
+				currentChunk = append(currentChunk, block)
 			}
-			currentSection = "Date"
-			continue
-		}
-
-		if currentDevo == nil {
-			continue // skip preamble until the first date/devotional is found
-		}
-
-		// State machine based on Headings
-		if block.Type == typography.TypeHeading {
-			upperText := strings.ToUpper(text)
-
-			// If it's a heading right after Date, it's ALWAYS the Title
-			if currentSection == "Date" {
-				ref, quote, found := extractScripture(text)
-				if found {
-					currentDevo.Title = quote
-					currentDevo.ScriptureReference = ref
-					currentSection = "ScriptureQuote"
-				} else {
-					currentDevo.Title = text
-					currentSection = "Title"
-				}
-				continue
-			}
-
-			// Avoid matching titles containing the keywords by enforcing a length threshold
-			isSectionHeader := false
-			if len(text) < 35 {
-				switch {
-				case strings.Contains(upperText, "PRAYER") || strings.Contains(upperText, "PRAYER POINT"):
-					currentSection = "Prayer"
-					isSectionHeader = true
-				case strings.Contains(upperText, "CONFESSION") || strings.Contains(upperText, "REFLECTION"):
-					currentSection = "Reflection"
-					isSectionHeader = true
-				case strings.Contains(upperText, "FURTHER READING"):
-					currentSection = "FurtherReading"
-					isSectionHeader = true
-				case strings.Contains(upperText, "MEMORY VERSE"):
-					currentSection = "MemoryVerse"
-					isSectionHeader = true
-				case strings.Contains(upperText, "KEY POINT") || strings.Contains(upperText, "ACTION POINT"):
-					currentSection = "ActionPoints"
-					isSectionHeader = true
-				case strings.Contains(upperText, "DECLARATION"):
-					currentSection = "Declaration"
-					isSectionHeader = true
-				}
-			}
-
-			if isSectionHeader {
-				continue
-			}
-
-			// If it's a heading block during Title state, check if it is a scripture reference
-			if currentSection == "Title" {
-				ref, quote, found := extractScripture(text)
-				if found {
-					currentDevo.ScriptureReference = ref
-					if quote != "" {
-						currentDevo.ScriptureQuote = quote
-						currentSection = "Body"
-					} else {
-						currentSection = "ScriptureQuote"
-					}
-				} else {
-					currentDevo.Title += " " + text
-				}
-				continue
-			}
-
-			// Fallback for unknown headings
-			currentSection = "Body"
-			if currentDevo.Body != "" {
-				currentDevo.Body += "\n\n"
-			}
-			currentDevo.Body += text
-			continue
-		}
-
-		// Paragraphs map to the active section
-		switch currentSection {
-		case "Title":
-			// Extract both scripture quote and reference if they reside in the same block
-			ref, quote, found := extractScripture(text)
-			if found {
-				currentDevo.ScriptureReference = ref
-				if quote != "" {
-					currentDevo.ScriptureQuote = quote
-					currentSection = "Body"
-				} else {
-					currentSection = "ScriptureQuote"
-				}
-			} else {
-				currentDevo.Body += text
-				currentSection = "Body"
-			}
-		case "ScriptureQuote":
-			currentDevo.ScriptureQuote += text
-			currentSection = "Body"
-		case "Prayer":
-			if currentDevo.Prayer != "" {
-				currentDevo.Prayer += "\n"
-			}
-			currentDevo.Prayer += text
-		case "Reflection":
-			if currentDevo.Reflection != "" {
-				currentDevo.Reflection += "\n"
-			}
-			currentDevo.Reflection += text
-		case "ActionPoints":
-			if currentDevo.ActionPoints != "" {
-				currentDevo.ActionPoints += "\n"
-			}
-			currentDevo.ActionPoints += text
-		case "Body":
-			if currentDevo.Body != "" {
-				currentDevo.Body += "\n\n"
-			}
-			currentDevo.Body += text
-		default:
-			if currentDevo.Body != "" {
-				currentDevo.Body += "\n\n"
-			}
-			currentDevo.Body += text
 		}
 	}
 
-	// Append the very last devotional
-	if currentDevo != nil {
-		report.Devotionals = append(report.Devotionals, *currentDevo)
+	if len(currentChunk) > 0 {
+		chunks = append(chunks, currentChunk)
+	}
+
+	dayCounter := 1
+	for _, chunk := range chunks {
+		if len(chunk) == 0 {
+			continue
+		}
+
+		dateText := strings.TrimSpace(chunk[0].Text)
+		targetDay := dayCounter
+		parsedDay, err := parseDayFromDateString(dateText, year)
+		if err == nil && parsedDay > 0 {
+			targetDay = parsedDay
+			dayCounter = parsedDay + 1
+		} else {
+			dayCounter++
+		}
+
+		log.Printf("[PARSER] --> NEW DEVOTIONAL BOUNDARY FOUND: %s\n", dateText)
+		devo := parseDevotionalChunk(chunk, category, targetDay, packageID)
+		if devo != nil {
+			report.Devotionals = append(report.Devotionals, *devo)
+		}
 	}
 
 	report.TotalParsed = len(report.Devotionals)
@@ -266,39 +166,269 @@ func extractDevotionals(doc *typography.SemanticDocument, category string, year 
 	return report
 }
 
+// isHeader checks if the text begins with any of the provided header keywords
+func isHeader(upper string, keywords ...string) bool {
+	for _, kw := range keywords {
+		if strings.HasPrefix(upper, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseDevotionalChunk(blocks []typography.SemanticBlock, category string, targetDay int, packageID uuid.UUID) *models.Devotional {
+	devo := &models.Devotional{
+		ID:         uuid.New(),
+		PackageID:  packageID,
+		Category:   category,
+		DefaultDay: targetDay,
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+
+	if len(blocks) <= 1 {
+		return devo
+	}
+
+	// 1. Title is the first block after the Date
+	titleIndex := -1
+	for i := 1; i < len(blocks); i++ {
+		text := strings.TrimSpace(blocks[i].Text)
+		if text != "" {
+			devo.Title = text
+			titleIndex = i
+			
+			// Look ahead for "PART X"
+			if i+1 < len(blocks) {
+				nextText := strings.TrimSpace(blocks[i+1].Text)
+				if strings.HasPrefix(strings.ToUpper(nextText), "PART ") {
+					devo.Title += " " + nextText
+					titleIndex = i + 1
+				}
+			}
+			break
+		}
+	}
+
+	if titleIndex == -1 || titleIndex == len(blocks)-1 {
+		return devo
+	}
+
+	// 2. Identify explicit sections
+	sections := make(map[string][]string)
+	currentSection := "Scripture"
+
+	for i := titleIndex + 1; i < len(blocks); i++ {
+		text := strings.TrimSpace(blocks[i].Text)
+		if text == "" {
+			continue
+		}
+		upper := strings.ToUpper(text)
+
+		if isHeader(upper, "SCRIPTURE READING", "BIBLE READING", "BIBLE TEXT", "SCRIPTURE LESSON") {
+			currentSection = "Scripture"
+			continue
+		}
+		if isHeader(upper, "MESSAGE", "BODY") {
+			currentSection = "Body"
+			continue
+		}
+		if isHeader(upper, "PRAYER", "PRAYER POINT") {
+			currentSection = "Prayer"
+			continue
+		}
+		if isHeader(upper, "REFLECTION", "CONFESSION") {
+			currentSection = "Reflection"
+			continue
+		}
+		if isHeader(upper, "ACTION POINT", "KEY POINT") {
+			currentSection = "ActionPoint"
+			continue
+		}
+		if isHeader(upper, "MEMORY VERSE") {
+			currentSection = "MemoryVerse"
+			continue
+		}
+		if isHeader(upper, "FURTHER READING") {
+			currentSection = "FurtherReading"
+			continue
+		}
+		if isHeader(upper, "DECLARATION") {
+			currentSection = "Declaration"
+			continue
+		}
+
+		sections[currentSection] = append(sections[currentSection], text)
+	}
+
+	scriptureBlocks := sections["Scripture"]
+	bodyBlocks := sections["Body"]
+
+	// 3. Structural Healing: If no explicit MESSAGE header was found, the body accidentally merged into Scripture.
+	if len(bodyBlocks) == 0 && len(scriptureBlocks) > 0 {
+		splitIdx := -1
+		for i := 0; i < len(scriptureBlocks) && i < 3; i++ {
+			ref, _, found := extractScripture(scriptureBlocks[i])
+			if found && ref != "" {
+				// Assuming quote immediately follows reference block if the reference block is very short
+				if len(scriptureBlocks[i]) < 50 && i+1 < len(scriptureBlocks) {
+					splitIdx = i + 1
+				} else {
+					splitIdx = i
+				}
+				break
+			}
+		}
+
+		if splitIdx != -1 {
+			bodyBlocks = scriptureBlocks[splitIdx+1:]
+			scriptureBlocks = scriptureBlocks[:splitIdx+1]
+		} else {
+			// No scripture format matched. Assume first block is quote, rest is body.
+			bodyBlocks = scriptureBlocks[1:]
+			scriptureBlocks = scriptureBlocks[:1]
+		}
+	}
+
+	// 4. Extract ref and quote from the identified scripture blocks
+	if len(scriptureBlocks) > 0 {
+		scriptureText := strings.Join(scriptureBlocks, "\n\n")
+		ref, quote, found := extractScripture(scriptureText)
+		if found && ref != "" {
+			devo.ScriptureReference = ref
+			devo.ScriptureQuote = quote
+		} else {
+			devo.ScriptureQuote = scriptureText
+		}
+	}
+
+	// 5. Structural Healing 2: If author pasted scripture into the MESSAGE block
+	if devo.ScriptureReference == "" && len(bodyBlocks) > 0 {
+		ref, quote, found := extractScripture(bodyBlocks[0])
+		if found && ref != "" {
+			devo.ScriptureReference = ref
+			if quote != "" && quote != `""` {
+				devo.ScriptureQuote = quote
+			}
+			bodyBlocks = bodyBlocks[1:] // pop the quote from the body
+		}
+	}
+
+	// 6. Join sections
+	devo.Body = strings.Join(bodyBlocks, "\n\n")
+	devo.Prayer = strings.Join(sections["Prayer"], "\n\n")
+	devo.Reflection = strings.Join(sections["Reflection"], "\n\n")
+	
+	actionPoints := strings.Join(sections["ActionPoint"], "\n\n")
+	if actionPoints == "" {
+		actionPoints = strings.Join(sections["Declaration"], "\n\n")
+	}
+	devo.ActionPoints = actionPoints
+
+	// Cleanup
+	devo.ScriptureQuote = strings.Trim(devo.ScriptureQuote, `"'`)
+	if devo.ScriptureQuote == `""` || devo.ScriptureQuote == `"` {
+		devo.ScriptureQuote = ""
+	}
+
+	return devo
+}
+
 // Helpers
 func isDateOrDay(text string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(text))
-	// Match things like "JANUARY 4", "Jan 4", "DAY 4"
-	re := regexp.MustCompile(`^(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER|JAN|FEB|MAR|APR|JUN|JUL|AUG|SEP|OCT|NOV|DEC|DAY)\s+\d{1,2}`)
+	re := regexp.MustCompile(`(?i)^(?:DAY\s+\d{1,3}|(?:JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER|JAN|FEB|MAR|APR|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{1,2}(?:ST|ND|RD|TH)?|\d{1,2}(?:ST|ND|RD|TH)?\s+(?:JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER|JAN|FEB|MAR|APR|JUN|JUL|AUG|SEP|OCT|NOV|DEC))\b`)
 	return re.MatchString(upper)
 }
 
-func isScriptureReference(text string) bool {
-	return strings.Contains(text, ":") || strings.Contains(text, " 1 ") || strings.Contains(text, " 2 ")
+func isMonthName(text string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(text))
+	months := []string{"JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER", "JAN", "FEB", "MAR", "APR", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"}
+	for _, m := range months {
+		if upper == m {
+			return true
+		}
+	}
+	return false
 }
 
+func isStandaloneDayNumber(text string) bool {
+	text = strings.TrimSpace(text)
+	if len(text) == 0 || len(text) > 4 {
+		return false
+	}
+	if text[0] < '0' || text[0] > '9' {
+		return false
+	}
+	for i := 1; i < len(text); i++ {
+		c := text[i]
+		isDigit := c >= '0' && c <= '9'
+		isLetter := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		if !isDigit && !isLetter {
+			return false
+		}
+	}
+	return true
+}
+
+// extractScripture parses a text block to separate a scripture reference from its quote text.
 func extractScripture(text string) (ref string, quote string, found bool) {
-	// Match book, chapter and verse (e.g. Luke 18:1, 1 Corinthians 13:4-8, Psalm 68:9)
-	re := regexp.MustCompile(`\(?((?:[1-9]\s+)?[A-Za-z]+(?:\s+[A-Za-z]+)*\s+\d+:\d+(?:\s*[-–—]\s*\d+)?)\)?`)
-	loc := re.FindStringSubmatchIndex(text)
-	if loc == nil {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return "", "", false
+	}
+
+	// Remove common header prefixes
+	headerPrefixes := []string{
+		"SCRIPTURE READING:", "SCRIPTURE LESSON:", "BIBLE READING:", "BIBLE TEXT:",
+		"SCRIPTURE:", "KEY VERSE:", "MEMORY VERSE:", "SCRIPTURE READING", "BIBLE READING",
+	}
+	cleanText := trimmed
+	for _, p := range headerPrefixes {
+		if strings.HasPrefix(strings.ToUpper(cleanText), p) {
+			cleanText = strings.TrimSpace(cleanText[len(p):])
+			break
+		}
+	}
+
+	// Match book, chapter and verse (e.g. 1 John 5:18, Luke 18:1, 1 Corinthians 13:4-8, Jeremiah. 33:6, 1John 5:1, Psalms 119: 105)
+	re := regexp.MustCompile(`(?i)\(?\b((?:[1-3]\s*)?[A-Z][A-Za-z.]*(?:\s+[A-Za-z.]+)*\s+\d+\s*:\s*\d+(?:\s*[-–—]\s*\d+)?)\)?`)
+	loc := re.FindStringSubmatchIndex(cleanText)
+	if loc == nil || len(loc) < 4 || loc[0] < 0 || loc[1] > len(cleanText) || loc[2] < 0 || loc[3] > len(cleanText) || loc[2] > loc[3] {
 		// Fallback to match book and chapter only (e.g. "1 Chronicles 29-30")
-		reNoVerse := regexp.MustCompile(`\(?((?:[1-9]\s+)?[A-Za-z]+(?:\s+[A-Za-z]+)*\s+\d+(?:\s*[-–—]\s*\d+)?)\)?`)
-		loc = reNoVerse.FindStringSubmatchIndex(text)
-		if loc == nil {
+		reNoVerse := regexp.MustCompile(`(?i)\(?\b((?:[1-3]\s*)?[A-Z][A-Za-z.]*(?:\s+[A-Za-z.]+)*\s+\d+(?:\s*[-–—]\s*\d+)?)\)?`)
+		loc = reNoVerse.FindStringSubmatchIndex(cleanText)
+		if loc == nil || len(loc) < 4 || loc[0] < 0 || loc[1] > len(cleanText) || loc[2] < 0 || loc[3] > len(cleanText) || loc[2] > loc[3] {
+			// Check if cleanText is just a quote without an embedded reference
+			if strings.HasPrefix(cleanText, `"`) || strings.HasPrefix(cleanText, `“`) || len(cleanText) > 20 {
+				return "", strings.Trim(cleanText, `()[]{}""'';,. `), false
+			}
 			return "", "", false
 		}
 	}
 
-	ref = text[loc[2]:loc[3]]
-	
-	// Remove the matched reference from the text to get the quote
-	rawQuote := text[:loc[0]] + text[loc[1]:]
+	ref = cleanText[loc[2]:loc[3]]
+	ref = strings.Trim(ref, "()")
+
+	// Remove matched reference to get the quote
+	rawQuote := cleanText[:loc[0]] + cleanText[loc[1]:]
 	rawQuote = strings.TrimSpace(rawQuote)
-	// Clean up quotes, brackets and trailing punctuation
 	rawQuote = strings.Trim(rawQuote, `()[]{}""'';,. `)
 	rawQuote = strings.TrimSpace(rawQuote)
+
+	// Filter out invalid/short non-quote strings (e.g. digits "1", "2" or header remnants)
+	if len(rawQuote) <= 3 {
+		isOnlyDigits := true
+		for _, r := range rawQuote {
+			if r < '0' || r > '9' {
+				isOnlyDigits = false
+				break
+			}
+		}
+		if isOnlyDigits || rawQuote == "" {
+			rawQuote = ""
+		}
+	}
 
 	return ref, rawQuote, true
 }
