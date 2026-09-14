@@ -104,6 +104,7 @@ func registerRoutes(r *gin.Engine) {
 		api.GET("/devotionals/today", handlers.GetTodayDevotionalHandler)
 		api.GET("/devotionals/date", handlers.GetDevotionalByDateHandler)
 		api.GET("/devotionals/calendar", handlers.GetCalendarDevotionalsHandler)
+		api.GET("/devotionals/:id", handlers.GetDevotionalByIDHandler)
 		api.GET("/packages/active", handlers.GetActivePackageDevotionalsHandler)
 		api.GET("/settings", handlers.GetSettingsHandler)
 		api.POST("/feedback", handlers.SubmitFeedbackHandler)

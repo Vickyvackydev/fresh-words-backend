@@ -260,3 +260,26 @@ func GetActivePackageDevotionalsHandler(c *gin.Context) {
 
 	utils.SendSuccess(c, http.StatusOK, "Active package devotionals retrieved successfully", devotionals)
 }
+
+// GetDevotionalByIDHandler retrieves a single devotional by its UUID.
+func GetDevotionalByIDHandler(c *gin.Context) {
+	idStr := c.Param("id")
+	devotionalID, err := uuid.Parse(idStr)
+	if err != nil {
+		utils.SendError(c, http.StatusBadRequest, "Invalid devotional ID format", err.Error())
+		return
+	}
+
+	var devo models.Devotional
+	err = db.DB.First(&devo, "id = ?", devotionalID).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			utils.SendError(c, http.StatusNotFound, "Devotional not found", nil)
+			return
+		}
+		utils.SendError(c, http.StatusInternalServerError, "Database query failed", err.Error())
+		return
+	}
+
+	utils.SendSuccess(c, http.StatusOK, "Devotional retrieved successfully", devo)
+}
