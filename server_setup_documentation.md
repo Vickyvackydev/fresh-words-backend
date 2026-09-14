@@ -49,7 +49,19 @@ server {
     # By default, Nginx limits uploads to 1MB. We increase this to 250MB to support large devotional documents.
     client_max_body_size 250M;
 
-    # 2. REACT ADMIN PANEL ROUTING
+    # 2. APPLE UNIVERSAL LINKS & ANDROID APP LINKS (.well-known)
+    # Serves Apple AASA (with application/json content-type) and Android assetlinks.json directly with no redirects
+    location = /.well-known/apple-app-site-association {
+        default_type application/json;
+        root /var/www/fresh-words-admin;
+    }
+
+    location = /.well-known/assetlinks.json {
+        default_type application/json;
+        root /var/www/fresh-words-admin;
+    }
+
+    # 3. REACT ADMIN PANEL ROUTING
     # Tells Nginx where to find static React files.
     # 'try_files $uri $uri/ /index.html' is critical for SPAs. If a user requests a path directly (like /privacy),
     # Nginx serves index.html and lets React Router handle the view rendering in the browser.
