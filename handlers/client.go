@@ -8,6 +8,7 @@ import (
 
 	"fresh-words-backend/db"
 	"fresh-words-backend/models"
+	"fresh-words-backend/services"
 	"fresh-words-backend/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -64,7 +65,14 @@ func GetTodayDevotionalHandler(c *gin.Context) {
 				utils.SendError(c, http.StatusNotFound, "No devotionals published or scheduled for this date", nil)
 				return
 			}
-			utils.SendSuccess(c, http.StatusOK, "No active schedule found; returned fallback day 1", devotional)
+			devoToReturn := devotional
+			lang := c.Query("lang")
+			if lang != "" && lang != "en" {
+				if trans, err := services.TranslateDevotional(&devoToReturn, lang); err == nil && trans != nil {
+					devoToReturn = *trans
+				}
+			}
+			utils.SendSuccess(c, http.StatusOK, "No active schedule found; returned fallback day 1", devoToReturn)
 			return
 		}
 
@@ -72,7 +80,15 @@ func GetTodayDevotionalHandler(c *gin.Context) {
 		return
 	}
 
-	utils.SendSuccess(c, http.StatusOK, "Today's devotional retrieved successfully", schedule.Devotional)
+	devoToReturn := schedule.Devotional
+	lang := c.Query("lang")
+	if lang != "" && lang != "en" {
+		if trans, err := services.TranslateDevotional(&devoToReturn, lang); err == nil && trans != nil {
+			devoToReturn = *trans
+		}
+	}
+
+	utils.SendSuccess(c, http.StatusOK, "Today's devotional retrieved successfully", devoToReturn)
 }
 
 // GetDevotionalByDateHandler gets the scheduled devotional for a specific calendar date (YYYY-MM-DD).
@@ -108,7 +124,15 @@ func GetDevotionalByDateHandler(c *gin.Context) {
 		return
 	}
 
-	utils.SendSuccess(c, http.StatusOK, "Devotional retrieved successfully", schedule.Devotional)
+	devoToReturn := schedule.Devotional
+	lang := c.Query("lang")
+	if lang != "" && lang != "en" {
+		if trans, err := services.TranslateDevotional(&devoToReturn, lang); err == nil && trans != nil {
+			devoToReturn = *trans
+		}
+	}
+
+	utils.SendSuccess(c, http.StatusOK, "Devotional retrieved successfully", devoToReturn)
 }
 
 // GetCalendarDevotionalsHandler returns daily titles and scheduled states for a month grid.
@@ -281,5 +305,73 @@ func GetDevotionalByIDHandler(c *gin.Context) {
 		return
 	}
 
-	utils.SendSuccess(c, http.StatusOK, "Devotional retrieved successfully", devo)
+	devoToReturn := devo
+	lang := c.Query("lang")
+	if lang != "" && lang != "en" {
+		if trans, err := services.TranslateDevotional(&devoToReturn, lang); err == nil && trans != nil {
+			devoToReturn = *trans
+		}
+	}
+
+	utils.SendSuccess(c, http.StatusOK, "Devotional retrieved successfully", devoToReturn)
+}
+
+// TranslateDevotionalHandler translates a devotional on-demand by ID
+func TranslateDevotionalHandler(c *gin.Context) {
+	idStr := c.Param("id")
+	lang := c.DefaultQuery("lang", "fr")
+
+	devotionalID, err := uuid.Parse(idStr)
+	if err != nil {
+		utils.SendError(c, http.StatusBadRequest, "Invalid devotional ID format", err.Error())
+		return
+	}
+
+	var devo models.Devotional
+	if err := db.DB.First(&devo, "id = ?", devotionalID).Error; err != nil {
+		utils.SendError(c, http.StatusNotFound, "Devotional not found", nil)
+		return
+	}
+
+	translated, err := services.TranslateDevotional(&devo, lang)
+	if err != nil {
+		utils.SendError(c, http.StatusInternalServerError, "Translation failed", err.Error())
+		return
+	}
+
+	utils.SendSuccess(c, http.StatusOK, "Devotional translated successfully", translated)
+}
+
+type TranslateBibleRequest struct {
+	Book     string   `json:"book" binding:"required"`
+	Chapter  int      `json:"chapter" binding:"required"`
+	Verses   []string `json:"verses" binding:"required"`
+	Language string   `json:"language"`
+}
+
+// TranslateBibleHandler translates a chapter of Bible verses on-demand
+func TranslateBibleHandler(c *gin.Context) {
+	var req TranslateBibleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.SendError(c, http.StatusBadRequest, "Invalid request payload", err.Error())
+		return
+	}
+
+	lang := req.Language
+	if lang == "" {
+		lang = c.DefaultQuery("lang", "fr")
+	}
+
+	translatedVerses, err := services.TranslateBibleChapter(req.Book, req.Chapter, req.Verses, lang)
+	if err != nil {
+		utils.SendError(c, http.StatusInternalServerError, "Translation failed", err.Error())
+		return
+	}
+
+	utils.SendSuccess(c, http.StatusOK, "Bible chapter translated successfully", gin.H{
+		"book":     req.Book,
+		"chapter":  req.Chapter,
+		"language": lang,
+		"verses":   translatedVerses,
+	})
 }

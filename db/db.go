@@ -92,6 +92,8 @@ func ConnectDB() {
 			&models.DevotionalSchedule{},
 			&models.UserBookmark{},
 			&models.DevotionalRead{},
+			&models.Hymn{},
+			&models.ContentTranslation{},
 		)
 		if err != nil {
 			log.Fatalf("Database AutoMigrate failed: %v", err)

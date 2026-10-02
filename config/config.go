@@ -19,6 +19,8 @@ type Config struct {
 	JWTSecret     string
 	AdminEmail    string
 	AdminPassword string
+	GeminiAPIKey  string
+	GeminiModel   string
 }
 
 var AppConfig Config
@@ -41,6 +43,8 @@ func LoadConfig() {
 		JWTSecret:     os.Getenv("JWT_SECRET"),
 		AdminEmail:    os.Getenv("ADMIN_EMAIL"),
 		AdminPassword: os.Getenv("ADMIN_PASSWORD"),
+		GeminiAPIKey:  os.Getenv("GEMINI_API_KEY"),
+		GeminiModel:   getEnv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
 	}
 
 	// Validate critical variables

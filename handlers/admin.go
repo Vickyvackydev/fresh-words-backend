@@ -41,6 +41,14 @@ type SettingsUpdateRequest struct {
 
 	DailyQuoteText    string `json:"daily_quote_text"`
 	DailyQuoteAuthor  string `json:"daily_quote_author"`
+
+	LatestAppVersion   string `json:"latest_app_version"`
+	MinRequiredVersion string `json:"min_required_version"`
+	ForceUpdate        *bool  `json:"force_update"`
+	UpdateTitle        string `json:"update_title"`
+	UpdateMessage      string `json:"update_message"`
+	PlayStoreURL       string `json:"play_store_url"`
+	AppStoreURL        string `json:"app_store_url"`
 }
 
 // GetDashboardStatsHandler returns count statistics for the admin control panel.
@@ -331,6 +339,28 @@ func UpdateSettingsHandler(c *gin.Context) {
 	}
 	if req.DailyQuoteAuthor != "" {
 		settings.DailyQuoteAuthor = req.DailyQuoteAuthor
+	}
+
+	if req.LatestAppVersion != "" {
+		settings.LatestAppVersion = req.LatestAppVersion
+	}
+	if req.MinRequiredVersion != "" {
+		settings.MinRequiredVersion = req.MinRequiredVersion
+	}
+	if req.ForceUpdate != nil {
+		settings.ForceUpdate = *req.ForceUpdate
+	}
+	if req.UpdateTitle != "" {
+		settings.UpdateTitle = req.UpdateTitle
+	}
+	if req.UpdateMessage != "" {
+		settings.UpdateMessage = req.UpdateMessage
+	}
+	if req.PlayStoreURL != "" {
+		settings.PlayStoreURL = req.PlayStoreURL
+	}
+	if req.AppStoreURL != "" {
+		settings.AppStoreURL = req.AppStoreURL
 	}
 
 	var saveErr error

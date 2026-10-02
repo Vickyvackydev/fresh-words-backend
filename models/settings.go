@@ -35,6 +35,14 @@ type Settings struct {
 	DailyQuoteText    string         `gorm:"type:text;not null;default:'Now faith is the assurance of things hoped for, the conviction of things not seen.'" json:"daily_quote_text"`
 	DailyQuoteAuthor  string         `gorm:"type:varchar(255);not null;default:'Hebrews 11:1'" json:"daily_quote_author"`
 
+	LatestAppVersion   string `gorm:"type:varchar(50);not null;default:'1.0.3'" json:"latest_app_version"`
+	MinRequiredVersion string `gorm:"type:varchar(50);not null;default:'1.0.0'" json:"min_required_version"`
+	ForceUpdate        bool   `gorm:"type:boolean;not null;default:false" json:"force_update"`
+	UpdateTitle        string `gorm:"type:varchar(255);not null;default:'Update Available'" json:"update_title"`
+	UpdateMessage      string `gorm:"type:text;not null;default:'A new version of Fresh Devotionals is available with improved translations, bible features, and performance enhancements.'" json:"update_message"`
+	PlayStoreURL       string `gorm:"type:text;default:'https://play.google.com/store/apps/details?id=com.freshdevotionals.app'" json:"play_store_url"`
+	AppStoreURL        string `gorm:"type:text;default:'https://apps.apple.com/app/fresh-devotionals/id6742352824'" json:"app_store_url"`
+
 	CreatedAt         time.Time      `json:"created_at"`
 	UpdatedAt         time.Time      `json:"updated_at"`
 	DeletedAt         gorm.DeletedAt `gorm:"index" json:"-"`

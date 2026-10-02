@@ -13,6 +13,7 @@ import (
 	"fresh-words-backend/config"
 	"fresh-words-backend/db"
 	"fresh-words-backend/handlers"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -28,8 +29,9 @@ func main() {
 	// 2. Establish PostgreSQL database connection pool
 	db.ConnectDB()
 
-	// 3. Bootstrap default credentials
+	// 3. Bootstrap default credentials and initial hymns
 	handlers.BootstrapAdmin()
+	handlers.SeedDefaultHymns()
 
 	// 4. Initialize router
 	router := gin.Default()
@@ -112,6 +114,16 @@ func registerRoutes(r *gin.Engine) {
 		api.POST("/bookmarks", handlers.ToggleBookmarkHandler)
 		api.POST("/devotionals/read", handlers.RecordDevotionalReadHandler)
 
+		// Public Hymn Access (Mobile app endpoints)
+		api.GET("/hymns", handlers.GetHymnsHandler)
+		api.GET("/hymns/all", handlers.GetAllHymnsHandler)
+		api.GET("/hymns/:id", handlers.GetHymnByIDHandler)
+
+		// Dynamic Multi-Language AI Translation (Gemini API + PostgreSQL Cache)
+		api.POST("/translate/devotional/:id", handlers.TranslateDevotionalHandler)
+		api.POST("/translate/hymn/:id", handlers.TranslateHymnHandler)
+		api.POST("/translate/bible", handlers.TranslateBibleHandler)
+
 		// Protected Admin routes
 		admin := api.Group("/admin")
 		admin.Use(handlers.AuthMiddleware())
@@ -137,6 +149,13 @@ func registerRoutes(r *gin.Engine) {
 
 			// Devotional Operations
 			admin.PUT("/devotionals/:id", handlers.UpdateDevotionalHandler)
+
+			// Hymn Operations
+			admin.GET("/hymns", handlers.GetHymnsHandler)
+			admin.POST("/hymns", handlers.AdminCreateHymnHandler)
+			admin.PUT("/hymns/:id", handlers.AdminUpdateHymnHandler)
+			admin.DELETE("/hymns/:id", handlers.AdminDeleteHymnHandler)
+			admin.POST("/hymns/bulk", handlers.AdminBulkUploadHymnsHandler)
 		}
 	}
 }
