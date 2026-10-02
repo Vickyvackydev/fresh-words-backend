@@ -91,7 +91,7 @@ func GetHymnsHandler(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 500 {
+	if limit < 1 || limit > 1000 {
 		limit = 50
 	}
 	offset := (page - 1) * limit

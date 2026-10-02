@@ -57,11 +57,13 @@ func GetDashboardStatsHandler(c *gin.Context) {
 	var unreadFeedback int64
 	var publishedPackages int64
 	var totalDevotionals int64
+	var totalHymns int64
 
 	db.DB.Model(&models.Feedback{}).Count(&totalFeedback)
 	db.DB.Model(&models.Feedback{}).Where("is_read = ?", false).Count(&unreadFeedback)
 	db.DB.Model(&models.Package{}).Where("status = ?", "published").Count(&publishedPackages)
 	db.DB.Model(&models.Devotional{}).Count(&totalDevotionals)
+	db.DB.Model(&models.Hymn{}).Count(&totalHymns)
 
 	var activePackages []models.Package
 	err := db.DB.Preload("Devotionals").Where("status = ?", "published").Find(&activePackages).Error
@@ -131,6 +133,7 @@ func GetDashboardStatsHandler(c *gin.Context) {
 		"unread_feedback":                 unreadFeedback,
 		"published_packages":              publishedPackages,
 		"total_devotionals":               totalDevotionals,
+		"total_hymns":                     totalHymns,
 		"db_storage_usage":                "4.2 MB",
 		"active_packages":                 activePackages,
 		"total_active_reads":              totalActiveReads,
