@@ -15,8 +15,9 @@ type Hymn struct {
 	Verses    string         `gorm:"type:text;not null" json:"verses"` // JSON string array of stanzas
 	Category  string         `gorm:"type:text;index" json:"category,omitempty"`
 	Author    string         `gorm:"type:text" json:"author,omitempty"`
-	Key       string         `gorm:"type:text" json:"key,omitempty"` // Musical Key or Meter
-	CreatedAt time.Time      `json:"created_at"`
+	Key          string         `gorm:"type:text" json:"key,omitempty"` // Musical Key or Meter
+	IsTranslated bool           `gorm:"-" json:"is_translated,omitempty"`
+	CreatedAt    time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`
 	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
 }

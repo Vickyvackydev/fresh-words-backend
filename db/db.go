@@ -93,12 +93,19 @@ func ConnectDB() {
 			&models.UserBookmark{},
 			&models.DevotionalRead{},
 			&models.Hymn{},
+			&models.YorubaHymn{},
 			&models.ContentTranslation{},
 		)
 		if err != nil {
 			log.Fatalf("Database AutoMigrate failed: %v", err)
 		}
 		log.Println("Database AutoMigrate completed successfully!")
+
+		// Sanitize historical references to CAC from yoruba_hymns, hymns, and devotionals
+		_ = DB.Exec("UPDATE yoruba_hymns SET author = 'Ìwé Orin Mímọ́' WHERE author ILIKE '%CAC%' OR author ILIKE '%Christ Apostolic%'")
+		_ = DB.Exec("UPDATE yoruba_hymns SET category = 'Orin Mímọ́' WHERE category ILIKE '%CAC%' OR category ILIKE '%Christ Apostolic%'")
+		_ = DB.Exec("UPDATE hymns SET author = 'Ìwé Orin Mímọ́' WHERE author ILIKE '%CAC%' OR author ILIKE '%Christ Apostolic%'")
+		_ = DB.Exec("UPDATE hymns SET category = 'Orin Mímọ́' WHERE category ILIKE '%CAC%' OR category ILIKE '%Christ Apostolic%'")
 	} else {
 		log.Println("Database AutoMigrate skipped because SKIP_MIGRATION is set to true")
 	}

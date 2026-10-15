@@ -51,6 +51,10 @@ func parseJSONHymns(data []byte) ([]models.Hymn, error) {
 		Category string      `json:"category"`
 		Author   string      `json:"author"`
 		Key      string      `json:"key"`
+		Metadata struct {
+			Number int    `json:"number"`
+			Source string `json:"source"`
+		} `json:"metadata"`
 	}
 
 	var rawList []rawHymn
@@ -60,7 +64,11 @@ func parseJSONHymns(data []byte) ([]models.Hymn, error) {
 
 	var result []models.Hymn
 	for _, r := range rawList {
-		if r.Number <= 0 || strings.TrimSpace(r.Title) == "" {
+		hymnNum := r.Number
+		if hymnNum <= 0 && r.Metadata.Number > 0 {
+			hymnNum = r.Metadata.Number
+		}
+		if hymnNum <= 0 || strings.TrimSpace(r.Title) == "" {
 			continue
 		}
 
@@ -96,13 +104,26 @@ func parseJSONHymns(data []byte) ([]models.Hymn, error) {
 			versesJSON = "[]"
 		}
 
+		cat := strings.TrimSpace(r.Category)
+		if cat == "" && r.Metadata.Source != "" {
+			cat = strings.TrimSpace(r.Metadata.Source)
+		}
+		if strings.Contains(strings.ToUpper(cat), "CAC") || strings.Contains(strings.ToLower(cat), "christ apostolic") {
+			cat = "Orin Mímọ́"
+		}
+
+		author := strings.TrimSpace(r.Author)
+		if strings.Contains(strings.ToUpper(author), "CAC") || strings.Contains(strings.ToLower(author), "christ apostolic") {
+			author = "Ìwé Orin Mímọ́"
+		}
+
 		result = append(result, models.Hymn{
-			Number:   r.Number,
+			Number:   hymnNum,
 			Title:    strings.TrimSpace(r.Title),
 			Chorus:   strings.TrimSpace(r.Chorus),
 			Verses:   versesJSON,
-			Category: strings.TrimSpace(r.Category),
-			Author:   strings.TrimSpace(r.Author),
+			Category: cat,
+			Author:   author,
 			Key:      strings.TrimSpace(r.Key),
 		})
 	}

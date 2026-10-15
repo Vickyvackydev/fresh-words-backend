@@ -149,6 +149,9 @@ func registerRoutes(r *gin.Engine) {
 
 			// Devotional Operations
 			admin.PUT("/devotionals/:id", handlers.UpdateDevotionalHandler)
+			admin.GET("/devotionals/:id/translation", handlers.AdminGetDevotionalTranslationHandler)
+			admin.PUT("/devotionals/:id/translation", handlers.AdminSaveDevotionalTranslationHandler)
+			admin.POST("/devotionals/:id/translation/ai-draft", handlers.AdminGenerateDevotionalAIDraftHandler)
 
 			// Hymn Operations
 			admin.GET("/hymns", handlers.GetHymnsHandler)
@@ -156,6 +159,8 @@ func registerRoutes(r *gin.Engine) {
 			admin.PUT("/hymns/:id", handlers.AdminUpdateHymnHandler)
 			admin.DELETE("/hymns/:id", handlers.AdminDeleteHymnHandler)
 			admin.POST("/hymns/bulk", handlers.AdminBulkUploadHymnsHandler)
+			admin.GET("/hymns/:id/translation", handlers.AdminGetHymnTranslationHandler)
+			admin.PUT("/hymns/:id/translation", handlers.AdminSaveHymnTranslationHandler)
 		}
 	}
 }

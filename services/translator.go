@@ -246,15 +246,22 @@ func TranslateDevotional(devo *models.Devotional, targetLang string) (*models.De
 
 	inputBytes, _ := json.Marshal(inputData)
 
+	extraGuidelines := ""
+	if cleanLang == "yo" {
+		extraGuidelines = "\n- Yoruba Orthography (Àkọtọ́ Èdè Yorùbá): You MUST strictly use accurate Yoruba diacritics, tone marks (àmì ohùn: dọ \\, re, mi /), and sub-dots (ẹ, ọ, ṣ) on all Yoruba words without omission." +
+			"\n- Biblical Register: Use authentic Yoruba ecclesiastical and theological terminology as found in Bíbélì Mímọ́ (e.g., Oore-ọ̀fẹ́, Ìgbàlà, Ìbákẹ́gbẹ́pọ̀, Ẹ̀mí Mímọ́, Olùgbàlà, Òdodo, Ìyàsímímọ́)." +
+			"\n- Natural Expression: Avoid literal, robotic word-for-word translation of English idioms. Write natural, reverent, and deeply inspiring Yoruba."
+	}
+
 	prompt := fmt.Sprintf(
-		"You are a professional Christian theologian and translator. Translate the following devotional JSON into %s.\n"+
+		"You are a revered Christian theologian and expert Bible translator. Translate the following devotional JSON into %s.\n"+
 			"Guidelines:\n"+
 			"- Maintain reverent, sacred biblical language, spiritual depth, and emotional warmth.\n"+
 			"- Retain scripture references (e.g., 'John 3:16') in standard %s Bible format.\n"+
 			"- Preserve all paragraph breaks and markdown formatting in the body.\n"+
-			"- Return a JSON object with the exact keys: 'title', 'scripture_quote', 'scripture_reference', 'body', 'prayer', 'reflection'.\n\n"+
+			"- Return a JSON object with the exact keys: 'title', 'scripture_quote', 'scripture_reference', 'body', 'prayer', 'reflection'.%s\n\n"+
 			"Input JSON:\n%s",
-		langName, langName, string(inputBytes),
+		langName, langName, extraGuidelines, string(inputBytes),
 	)
 
 	jsonStr, geminiErr := CallGeminiJSON(prompt)
@@ -303,6 +310,64 @@ func TranslateDevotional(devo *models.Devotional, targetLang string) (*models.De
 	return &result, nil
 }
 
+// GenerateAIDevotionalDraft produces an AI translation draft for admin review without saving directly to the public cache.
+func GenerateAIDevotionalDraft(devo *models.Devotional, targetLang string) (*DevotionalTranslationPayload, error) {
+	if devo == nil {
+		return nil, errors.New("devotional is nil")
+	}
+
+	cleanLang := strings.ToLower(strings.TrimSpace(targetLang))
+	if cleanLang == "" {
+		cleanLang = "yo"
+	}
+
+	if strings.TrimSpace(config.AppConfig.GeminiAPIKey) == "" {
+		return nil, errors.New("Gemini API key is not configured")
+	}
+
+	langName := GetLanguageName(cleanLang)
+	inputData := DevotionalTranslationPayload{
+		Title:              devo.Title,
+		ScriptureQuote:     devo.ScriptureQuote,
+		ScriptureReference: devo.ScriptureReference,
+		Body:               devo.Body,
+		Prayer:             devo.Prayer,
+		Reflection:         devo.Reflection,
+	}
+
+	inputBytes, _ := json.Marshal(inputData)
+
+	extraGuidelines := ""
+	if cleanLang == "yo" {
+		extraGuidelines = "\n- Yoruba Orthography (Àkọtọ́ Èdè Yorùbá): You MUST strictly use accurate Yoruba diacritics, tone marks (àmì ohùn: dọ \\, re, mi /), and sub-dots (ẹ, ọ, ṣ) on all Yoruba words without omission." +
+			"\n- Biblical Register: Use authentic Yoruba ecclesiastical and theological terminology as found in Bíbélì Mímọ́ (e.g., Oore-ọ̀fẹ́, Ìgbàlà, Ìbákẹ́gbẹ́pọ̀, Ẹ̀mí Mímọ́, Olùgbàlà, Òdodo, Ìyàsímímọ́)." +
+			"\n- Natural Expression: Avoid literal, robotic word-for-word translation of English idioms. Write natural, reverent, and deeply inspiring Yoruba."
+	}
+
+	prompt := fmt.Sprintf(
+		"You are a revered Christian theologian and expert Bible translator. Translate the following devotional JSON into %s.\n"+
+			"Guidelines:\n"+
+			"- Maintain reverent, sacred biblical language, spiritual depth, and emotional warmth.\n"+
+			"- Retain scripture references (e.g., 'John 3:16') in standard %s Bible format.\n"+
+			"- Preserve all paragraph breaks and markdown formatting in the body.\n"+
+			"- Return a JSON object with the exact keys: 'title', 'scripture_quote', 'scripture_reference', 'body', 'prayer', 'reflection'.%s\n\n"+
+			"Input JSON:\n%s",
+		langName, langName, extraGuidelines, string(inputBytes),
+	)
+
+	jsonStr, err := CallGeminiJSON(prompt)
+	if err != nil {
+		return nil, fmt.Errorf("AI translation failed: %w", err)
+	}
+
+	var payload DevotionalTranslationPayload
+	if err := json.Unmarshal([]byte(jsonStr), &payload); err != nil {
+		return nil, fmt.Errorf("failed to parse AI translation JSON: %w", err)
+	}
+
+	return &payload, nil
+}
+
 // TranslateHymn checks cache, or calls Gemini to translate hymn lyrics into targetLang.
 func TranslateHymn(hymn *models.Hymn, targetLang string) (*models.Hymn, error) {
 	if hymn == nil {
@@ -316,7 +381,7 @@ func TranslateHymn(hymn *models.Hymn, targetLang string) (*models.Hymn, error) {
 
 	contentID := strconv.Itoa(hymn.Number)
 
-	// 1. Check PostgreSQL Translation Cache
+	// 1. Check PostgreSQL Translation Cache / Uploaded Yoruba Hymns
 	var cached models.ContentTranslation
 	err := db.DB.Where(
 		"content_type = ? AND content_id = ? AND language = ?",
@@ -327,6 +392,7 @@ func TranslateHymn(hymn *models.Hymn, targetLang string) (*models.Hymn, error) {
 		var payload HymnTranslationPayload
 		if jsonErr := json.Unmarshal([]byte(cached.TranslatedData), &payload); jsonErr == nil {
 			result := *hymn
+			result.IsTranslated = true
 			if payload.Title != "" {
 				result.Title = payload.Title
 			}
@@ -341,12 +407,18 @@ func TranslateHymn(hymn *models.Hymn, targetLang string) (*models.Hymn, error) {
 		}
 	}
 
-	// 2. If no Gemini API key configured, gracefully return English
+	// 2. IMPORTANT: For Yoruba hymns, congregations strictly require their authentic canonized hymnal (Ìwé Orin Mímọ́).
+	// Never generate artificial AI lyrics for Yoruba hymns if verified lyrics have not been uploaded by the admin.
+	if cleanLang == "yo" {
+		return hymn, nil
+	}
+
+	// 3. If no Gemini API key configured, gracefully return English
 	if strings.TrimSpace(config.AppConfig.GeminiAPIKey) == "" {
 		return hymn, nil
 	}
 
-	// 3. Request Translation from Gemini
+	// 4. Request Translation from Gemini for other languages
 	langName := GetLanguageName(cleanLang)
 
 	// Unmarshal existing verses
@@ -396,6 +468,7 @@ func TranslateHymn(hymn *models.Hymn, targetLang string) (*models.Hymn, error) {
 
 	// 5. Construct translated response
 	result := *hymn
+	result.IsTranslated = true
 	if payload.Title != "" {
 		result.Title = payload.Title
 	}

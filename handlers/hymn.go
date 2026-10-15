@@ -81,6 +81,12 @@ func normalizeVerses(val interface{}) (string, error) {
 	}
 }
 
+func isYorubaRequest(c *gin.Context) bool {
+	book := strings.ToLower(strings.TrimSpace(c.Query("book")))
+	lang := strings.ToLower(strings.TrimSpace(c.Query("lang")))
+	return book == "yoruba" || book == "yo" || lang == "yo"
+}
+
 // GetHymnsHandler handles paginated and searchable hymn list for clients & admin
 func GetHymnsHandler(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -95,6 +101,35 @@ func GetHymnsHandler(c *gin.Context) {
 		limit = 50
 	}
 	offset := (page - 1) * limit
+
+	if isYorubaRequest(c) {
+		query := db.DB.Model(&models.YorubaHymn{})
+		if category != "" && category != "All" {
+			query = query.Where("LOWER(category) = LOWER(?)", category)
+		}
+		if q != "" {
+			if num, err := strconv.Atoi(q); err == nil {
+				query = query.Where("number = ? OR LOWER(title) LIKE LOWER(?) OR LOWER(verses) LIKE LOWER(?) OR LOWER(author) LIKE LOWER(?)",
+					num, "%"+q+"%", "%"+q+"%", "%"+q+"%")
+			} else {
+				likeQuery := "%" + q + "%"
+				query = query.Where("LOWER(title) LIKE LOWER(?) OR LOWER(verses) LIKE LOWER(?) OR LOWER(chorus) LIKE LOWER(?) OR LOWER(author) LIKE LOWER(?)",
+					likeQuery, likeQuery, likeQuery, likeQuery)
+			}
+		}
+		var total int64
+		if err := query.Count(&total).Error; err != nil {
+			utils.SendError(c, http.StatusInternalServerError, "Failed to count Yoruba hymns", err.Error())
+			return
+		}
+		var yHymns []models.YorubaHymn
+		if err := query.Order("number asc").Limit(limit).Offset(offset).Find(&yHymns).Error; err != nil {
+			utils.SendError(c, http.StatusInternalServerError, "Failed to fetch Yoruba hymns", err.Error())
+			return
+		}
+		utils.SendPaginated(c, http.StatusOK, "Yoruba hymns retrieved successfully", yHymns, total, page, limit)
+		return
+	}
 
 	query := db.DB.Model(&models.Hymn{})
 
@@ -125,11 +160,62 @@ func GetHymnsHandler(c *gin.Context) {
 		return
 	}
 
+	lang := strings.ToLower(strings.TrimSpace(c.Query("lang")))
+	if lang != "" && lang != "en" && lang != "yo" {
+		applyHymnTranslations(hymns, lang)
+	}
+
 	utils.SendPaginated(c, http.StatusOK, "Hymns retrieved successfully", hymns, total, page, limit)
+}
+
+func applyHymnTranslations(hymns []models.Hymn, lang string) {
+	if len(hymns) == 0 {
+		return
+	}
+	var numbers []string
+	for _, h := range hymns {
+		numbers = append(numbers, strconv.Itoa(h.Number))
+	}
+	var translations []models.ContentTranslation
+	if err := db.DB.Where("content_type = ? AND language = ? AND content_id IN ?", "hymn", lang, numbers).Find(&translations).Error; err == nil {
+		transMap := make(map[string]services.HymnTranslationPayload)
+		for _, t := range translations {
+			var p services.HymnTranslationPayload
+			if jsonErr := json.Unmarshal([]byte(t.TranslatedData), &p); jsonErr == nil {
+				transMap[t.ContentID] = p
+			}
+		}
+		for i := range hymns {
+			key := strconv.Itoa(hymns[i].Number)
+			if p, ok := transMap[key]; ok {
+				hymns[i].IsTranslated = true
+				if p.Title != "" {
+					hymns[i].Title = p.Title
+				}
+				if p.Chorus != "" {
+					hymns[i].Chorus = p.Chorus
+				}
+				if len(p.Verses) > 0 {
+					vBytes, _ := json.Marshal(p.Verses)
+					hymns[i].Verses = string(vBytes)
+				}
+			}
+		}
+	}
 }
 
 // GetAllHymnsHandler returns all hymns for offline client caching
 func GetAllHymnsHandler(c *gin.Context) {
+	if isYorubaRequest(c) {
+		var yHymns []models.YorubaHymn
+		if err := db.DB.Order("number asc").Find(&yHymns).Error; err != nil {
+			utils.SendError(c, http.StatusInternalServerError, "Failed to fetch all Yoruba hymns", err.Error())
+			return
+		}
+		utils.SendSuccess(c, http.StatusOK, "All Yoruba hymns retrieved successfully", yHymns)
+		return
+	}
+
 	var hymns []models.Hymn
 	if err := db.DB.Order("number asc").Find(&hymns).Error; err != nil {
 		utils.SendError(c, http.StatusInternalServerError, "Failed to fetch all hymns", err.Error())
@@ -142,12 +228,42 @@ func GetAllHymnsHandler(c *gin.Context) {
 		db.DB.Order("number asc").Find(&hymns)
 	}
 
+	lang := strings.ToLower(strings.TrimSpace(c.Query("lang")))
+	if lang != "" && lang != "en" && lang != "yo" {
+		applyHymnTranslations(hymns, lang)
+	}
+
 	utils.SendSuccess(c, http.StatusOK, "All hymns retrieved successfully", hymns)
 }
 
 // GetHymnByIDHandler retrieves a single hymn by UUID or Number
 func GetHymnByIDHandler(c *gin.Context) {
 	param := strings.TrimSpace(c.Param("id"))
+
+	if isYorubaRequest(c) {
+		var yHymn models.YorubaHymn
+		var err error
+		if hymnNum, numErr := strconv.Atoi(param); numErr == nil {
+			err = db.DB.Where("number = ?", hymnNum).First(&yHymn).Error
+		} else if u, uuidErr := uuid.Parse(param); uuidErr == nil {
+			err = db.DB.Where("id = ?", u).First(&yHymn).Error
+		} else {
+			utils.SendError(c, http.StatusBadRequest, "Invalid hymn identifier", nil)
+			return
+		}
+
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				utils.SendError(c, http.StatusNotFound, "Yoruba hymn not found", nil)
+				return
+			}
+			utils.SendError(c, http.StatusInternalServerError, "Failed to fetch Yoruba hymn", err.Error())
+			return
+		}
+
+		utils.SendSuccess(c, http.StatusOK, "Yoruba hymn retrieved successfully", yHymn)
+		return
+	}
 
 	var hymn models.Hymn
 	var err error
@@ -172,7 +288,7 @@ func GetHymnByIDHandler(c *gin.Context) {
 
 	hymnToReturn := hymn
 	lang := c.Query("lang")
-	if lang != "" && lang != "en" {
+	if lang != "" && lang != "en" && lang != "yo" {
 		if trans, err := services.TranslateHymn(&hymnToReturn, lang); err == nil && trans != nil {
 			hymnToReturn = *trans
 		}
@@ -220,17 +336,41 @@ func AdminCreateHymnHandler(c *gin.Context) {
 		return
 	}
 
-	// Check if hymn number already exists
+	versesStr, err := normalizeVerses(req.Verses)
+	if err != nil {
+		utils.SendError(c, http.StatusBadRequest, "Invalid verses format", err.Error())
+		return
+	}
+
+	if isYorubaRequest(c) {
+		var count int64
+		db.DB.Model(&models.YorubaHymn{}).Where("number = ?", req.Number).Count(&count)
+		if count > 0 {
+			utils.SendError(c, http.StatusConflict, "Yoruba hymn number already exists", nil)
+			return
+		}
+		yHymn := models.YorubaHymn{
+			Number:   req.Number,
+			Title:    strings.TrimSpace(req.Title),
+			Chorus:   strings.TrimSpace(req.Chorus),
+			Verses:   versesStr,
+			Category: strings.TrimSpace(req.Category),
+			Author:   strings.TrimSpace(req.Author),
+			Key:      cleanKey(req.Key),
+		}
+		if err := db.DB.Create(&yHymn).Error; err != nil {
+			utils.SendError(c, http.StatusInternalServerError, "Failed to create Yoruba hymn", err.Error())
+			return
+		}
+		utils.SendSuccess(c, http.StatusCreated, "Yoruba hymn created successfully", yHymn)
+		return
+	}
+
+	// Check if hymn number already exists in English hymns
 	var count int64
 	db.DB.Model(&models.Hymn{}).Where("number = ?", req.Number).Count(&count)
 	if count > 0 {
 		utils.SendError(c, http.StatusConflict, "Hymn number already exists", nil)
-		return
-	}
-
-	versesStr, err := normalizeVerses(req.Verses)
-	if err != nil {
-		utils.SendError(c, http.StatusBadRequest, "Invalid verses format", err.Error())
 		return
 	}
 
@@ -261,6 +401,57 @@ func AdminUpdateHymnHandler(c *gin.Context) {
 		return
 	}
 
+	var req UpdateHymnRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.SendError(c, http.StatusBadRequest, "Validation error", err.Error())
+		return
+	}
+
+	if isYorubaRequest(c) {
+		var yHymn models.YorubaHymn
+		if err := db.DB.First(&yHymn, "id = ?", hymnUUID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				utils.SendError(c, http.StatusNotFound, "Yoruba hymn not found", nil)
+				return
+			}
+			utils.SendError(c, http.StatusInternalServerError, "Failed to find Yoruba hymn", err.Error())
+			return
+		}
+		if req.Number > 0 && req.Number != yHymn.Number {
+			var count int64
+			db.DB.Model(&models.YorubaHymn{}).Where("number = ? AND id != ?", req.Number, yHymn.ID).Count(&count)
+			if count > 0 {
+				utils.SendError(c, http.StatusConflict, "Yoruba hymn number already in use", nil)
+				return
+			}
+			yHymn.Number = req.Number
+		}
+		if req.Title != "" {
+			yHymn.Title = strings.TrimSpace(req.Title)
+		}
+		yHymn.Chorus = strings.TrimSpace(req.Chorus)
+		if req.Category != "" {
+			yHymn.Category = strings.TrimSpace(req.Category)
+		}
+		if req.Author != "" {
+			yHymn.Author = strings.TrimSpace(req.Author)
+		}
+		if req.Key != "" {
+			yHymn.Key = cleanKey(req.Key)
+		}
+		if req.Verses != nil {
+			if versesStr, vErr := normalizeVerses(req.Verses); vErr == nil {
+				yHymn.Verses = versesStr
+			}
+		}
+		if err := db.DB.Save(&yHymn).Error; err != nil {
+			utils.SendError(c, http.StatusInternalServerError, "Failed to update Yoruba hymn", err.Error())
+			return
+		}
+		utils.SendSuccess(c, http.StatusOK, "Yoruba hymn updated successfully", yHymn)
+		return
+	}
+
 	var hymn models.Hymn
 	if err := db.DB.First(&hymn, "id = ?", hymnUUID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -268,12 +459,6 @@ func AdminUpdateHymnHandler(c *gin.Context) {
 			return
 		}
 		utils.SendError(c, http.StatusInternalServerError, "Failed to find hymn", err.Error())
-		return
-	}
-
-	var req UpdateHymnRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.SendError(c, http.StatusBadRequest, "Validation error", err.Error())
 		return
 	}
 
@@ -322,6 +507,15 @@ func AdminDeleteHymnHandler(c *gin.Context) {
 	hymnUUID, err := uuid.Parse(idParam)
 	if err != nil {
 		utils.SendError(c, http.StatusBadRequest, "Invalid hymn ID", err.Error())
+		return
+	}
+
+	if isYorubaRequest(c) {
+		if err := db.DB.Delete(&models.YorubaHymn{}, "id = ?", hymnUUID).Error; err != nil {
+			utils.SendError(c, http.StatusInternalServerError, "Failed to delete Yoruba hymn", err.Error())
+			return
+		}
+		utils.SendSuccess(c, http.StatusOK, "Yoruba hymn deleted successfully", nil)
 		return
 	}
 
@@ -390,9 +584,65 @@ func AdminBulkUploadHymnsHandler(c *gin.Context) {
 		return
 	}
 
+	uploadBook := strings.ToLower(strings.TrimSpace(c.DefaultQuery("book", c.PostForm("book"))))
+	uploadLang := strings.ToLower(strings.TrimSpace(c.DefaultQuery("lang", c.PostForm("lang"))))
+	isYoruba := uploadBook == "yoruba" || uploadBook == "yo" || uploadLang == "yo"
+
 	var insertedCount int
 	var updatedCount int
 	var errorMessages []string
+
+	if isYoruba {
+		// Populate models.YorubaHymn directly - completely isolated from English hymns!
+		for _, item := range parsedHymns {
+			if item.Number <= 0 || strings.TrimSpace(item.Title) == "" {
+				continue
+			}
+
+			var existing models.YorubaHymn
+			findErr := db.DB.Unscoped().Where("number = ?", item.Number).First(&existing).Error
+			if findErr == nil {
+				existing.Title = item.Title
+				existing.Chorus = item.Chorus
+				existing.Verses = item.Verses
+				existing.Category = item.Category
+				existing.Author = item.Author
+				existing.Key = item.Key
+				existing.DeletedAt = gorm.DeletedAt{}
+				if err := db.DB.Save(&existing).Error; err == nil {
+					updatedCount++
+				} else {
+					errorMessages = append(errorMessages, "Hymn #"+strconv.Itoa(item.Number)+": "+err.Error())
+				}
+			} else {
+				newHymn := models.YorubaHymn{
+					ID:       uuid.New(),
+					Number:   item.Number,
+					Title:    item.Title,
+					Chorus:   item.Chorus,
+					Verses:   item.Verses,
+					Category: item.Category,
+					Author:   item.Author,
+					Key:      item.Key,
+				}
+				if err := db.DB.Create(&newHymn).Error; err == nil {
+					insertedCount++
+				} else {
+					errorMessages = append(errorMessages, "Hymn #"+strconv.Itoa(item.Number)+": "+err.Error())
+				}
+			}
+		}
+
+		utils.SendSuccess(c, http.StatusOK, "Bulk import for Yoruba hymnal completed", gin.H{
+			"inserted": insertedCount,
+			"updated":  updatedCount,
+			"total":    len(parsedHymns),
+			"count":    insertedCount + updatedCount,
+			"book":     "yoruba",
+			"errors":   errorMessages,
+		})
+		return
+	}
 
 	for _, item := range parsedHymns {
 		if item.Number <= 0 || strings.TrimSpace(item.Title) == "" {
@@ -452,8 +702,139 @@ func AdminBulkUploadHymnsHandler(c *gin.Context) {
 	})
 }
 
+type SaveHymnTranslationRequest struct {
+	Language string      `json:"language"`
+	Title    string      `json:"title"`
+	Chorus   string      `json:"chorus"`
+	Verses   interface{} `json:"verses"`
+}
+
+// AdminGetHymnTranslationHandler returns the verified translation for a hymn
+func AdminGetHymnTranslationHandler(c *gin.Context) {
+	idParam := strings.TrimSpace(c.Param("id"))
+	lang := strings.ToLower(strings.TrimSpace(c.DefaultQuery("lang", "yo")))
+
+	var hymn models.Hymn
+	var err error
+	if hymnNum, numErr := strconv.Atoi(idParam); numErr == nil {
+		err = db.DB.Where("number = ?", hymnNum).First(&hymn).Error
+	} else if u, uuidErr := uuid.Parse(idParam); uuidErr == nil {
+		err = db.DB.Where("id = ?", u).First(&hymn).Error
+	} else {
+		utils.SendError(c, http.StatusBadRequest, "Invalid hymn identifier", nil)
+		return
+	}
+
+	if err != nil {
+		utils.SendError(c, http.StatusNotFound, "Hymn not found", nil)
+		return
+	}
+
+	var trans models.ContentTranslation
+	contentID := strconv.Itoa(hymn.Number)
+	findErr := db.DB.Where("content_type = ? AND content_id = ? AND language = ?", "hymn", contentID, lang).First(&trans).Error
+	if findErr != nil {
+		utils.SendSuccess(c, http.StatusOK, "Translation not found, returning empty template", gin.H{
+			"content_id": contentID,
+			"language":   lang,
+			"title":      "",
+			"chorus":     "",
+			"verses":     []string{},
+		})
+		return
+	}
+
+	var payload services.HymnTranslationPayload
+	if err := json.Unmarshal([]byte(trans.TranslatedData), &payload); err != nil {
+		utils.SendError(c, http.StatusInternalServerError, "Failed to parse translation data", err.Error())
+		return
+	}
+
+	utils.SendSuccess(c, http.StatusOK, "Hymn translation retrieved successfully", gin.H{
+		"content_id": contentID,
+		"language":   lang,
+		"title":      payload.Title,
+		"chorus":     payload.Chorus,
+		"verses":     payload.Verses,
+	})
+}
+
+// AdminSaveHymnTranslationHandler updates or creates the verified translation for a hymn
+func AdminSaveHymnTranslationHandler(c *gin.Context) {
+	idParam := strings.TrimSpace(c.Param("id"))
+	lang := strings.ToLower(strings.TrimSpace(c.DefaultQuery("lang", "yo")))
+
+	var hymn models.Hymn
+	var err error
+	if hymnNum, numErr := strconv.Atoi(idParam); numErr == nil {
+		err = db.DB.Where("number = ?", hymnNum).First(&hymn).Error
+	} else if u, uuidErr := uuid.Parse(idParam); uuidErr == nil {
+		err = db.DB.Where("id = ?", u).First(&hymn).Error
+	} else {
+		utils.SendError(c, http.StatusBadRequest, "Invalid hymn identifier", nil)
+		return
+	}
+
+	if err != nil {
+		utils.SendError(c, http.StatusNotFound, "Hymn not found", nil)
+		return
+	}
+
+	var req SaveHymnTranslationRequest
+	if bindErr := c.ShouldBindJSON(&req); bindErr != nil {
+		utils.SendError(c, http.StatusBadRequest, "Invalid translation body", bindErr.Error())
+		return
+	}
+
+	if req.Language != "" {
+		lang = strings.ToLower(strings.TrimSpace(req.Language))
+	}
+
+	versesJSON, err := normalizeVerses(req.Verses)
+	if err != nil {
+		utils.SendError(c, http.StatusBadRequest, "Invalid verses format", err.Error())
+		return
+	}
+	var vList []string
+	_ = json.Unmarshal([]byte(versesJSON), &vList)
+
+	payload := services.HymnTranslationPayload{
+		Title:  strings.TrimSpace(req.Title),
+		Chorus: strings.TrimSpace(req.Chorus),
+		Verses: vList,
+	}
+	dataBytes, _ := json.Marshal(payload)
+
+	contentID := strconv.Itoa(hymn.Number)
+	var existing models.ContentTranslation
+	findErr := db.DB.Where("content_type = ? AND content_id = ? AND language = ?", "hymn", contentID, lang).First(&existing).Error
+	if findErr == nil {
+		existing.TranslatedData = string(dataBytes)
+		if saveErr := db.DB.Save(&existing).Error; saveErr != nil {
+			utils.SendError(c, http.StatusInternalServerError, "Failed to update translation", saveErr.Error())
+			return
+		}
+	} else {
+		newTrans := models.ContentTranslation{
+			ContentType:    "hymn",
+			ContentID:      contentID,
+			Language:       lang,
+			TranslatedData: string(dataBytes),
+		}
+		if createErr := db.DB.Create(&newTrans).Error; createErr != nil {
+			utils.SendError(c, http.StatusInternalServerError, "Failed to create translation", createErr.Error())
+			return
+		}
+	}
+
+	utils.SendSuccess(c, http.StatusOK, "Hymn translation saved successfully", payload)
+}
+
 // SeedDefaultHymns populates classic hymns and repairs corrupted hymns or double keys
 func SeedDefaultHymns() {
+	// Clean up any empty placeholder hymns created in the English hymns table
+	db.DB.Unscoped().Where("(verses = ? OR verses = ? OR verses IS NULL) AND title LIKE ?", "[]", "null", "Hymn %").Delete(&models.Hymn{})
+
 	defaults := []models.Hymn{
 		{
 			Number:   1,
