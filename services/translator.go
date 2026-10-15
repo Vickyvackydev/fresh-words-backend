@@ -87,23 +87,29 @@ type HymnTranslationPayload struct {
 func CallGeminiJSON(prompt string) (string, error) {
 	apiKey := strings.TrimSpace(config.AppConfig.GeminiAPIKey)
 	if apiKey == "" {
-		return "", errors.New("GEMINI_API_KEY is not configured in backend")
+		return "", errors.New("GEMINI_API_KEY is not configured")
 	}
 
 	primaryModel := strings.TrimSpace(config.AppConfig.GeminiModel)
-	if primaryModel == "" {
-		primaryModel = "gemini-2.5-flash"
+	
+	// If empty or set to a non-existent 2.5 model, default to 1.5
+	if primaryModel == "" || strings.Contains(primaryModel, "2.5") {
+		primaryModel = "gemini-1.5-flash" 
 	}
 
-	// Model candidates in priority order
+	// Correct Production Model List (as of late 2024/early 2025)
 	candidates := []string{primaryModel}
-	fallbacks := []string{"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-1.5-flash"}
+	fallbacks := []string{
+		"gemini-1.5-flash",      // Reliable, fast
+		"gemini-1.5-pro",        // Smarter, more nuanced
+		"gemini-1.5-flash-8b",   // Fast fallback
+	}
+
 	for _, fb := range fallbacks {
 		if fb != primaryModel {
 			candidates = append(candidates, fb)
 		}
 	}
-
 	var lastErr error
 	client := &http.Client{Timeout: 30 * time.Second}
 
