@@ -44,7 +44,7 @@ func LoadConfig() {
 		AdminEmail:    os.Getenv("ADMIN_EMAIL"),
 		AdminPassword: os.Getenv("ADMIN_PASSWORD"),
 		GeminiAPIKey:  os.Getenv("GEMINI_API_KEY"),
-		GeminiModel:   getEnv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+		GeminiModel:   getEnv("GEMINI_MODEL", "gemini-2.5-flash"),
 	}
 
 	// Validate critical variables

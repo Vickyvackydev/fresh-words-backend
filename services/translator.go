@@ -92,12 +92,12 @@ func CallGeminiJSON(prompt string) (string, error) {
 
 	primaryModel := strings.TrimSpace(config.AppConfig.GeminiModel)
 	if primaryModel == "" {
-		primaryModel = "gemini-3.5-flash-lite"
+		primaryModel = "gemini-2.5-flash"
 	}
 
 	// Model candidates in priority order
 	candidates := []string{primaryModel}
-	fallbacks := []string{"gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.8-flash"}
+	fallbacks := []string{"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-1.5-flash"}
 	for _, fb := range fallbacks {
 		if fb != primaryModel {
 			candidates = append(candidates, fb)
