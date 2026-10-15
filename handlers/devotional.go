@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"fresh-words-backend/db"
 	"fresh-words-backend/models"
@@ -191,4 +192,137 @@ func AdminGenerateDevotionalAIDraftHandler(c *gin.Context) {
 	}
 
 	utils.SendSuccess(c, http.StatusOK, "AI translation draft generated successfully", draft)
+}
+
+type CreateDevotionalRequest struct {
+	Category           string `json:"category" binding:"required"`
+	PackageID          string `json:"package_id"`
+	DefaultDay         int    `json:"default_day" binding:"required"`
+	Title              string `json:"title" binding:"required"`
+	ScriptureReference string `json:"scripture_reference" binding:"required"`
+	ScriptureQuote     string `json:"scripture_quote" binding:"required"`
+	Body               string `json:"body" binding:"required"`
+	Prayer             string `json:"prayer"`
+	Reflection         string `json:"reflection"`
+	ActionPoints       string `json:"action_points"`
+}
+
+// AdminCreateDevotionalHandler creates a single new devotional entry attached to a category package
+func AdminCreateDevotionalHandler(c *gin.Context) {
+	var req CreateDevotionalRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.SendError(c, http.StatusBadRequest, "Invalid request body: "+err.Error(), err.Error())
+		return
+	}
+
+	cleanCategory := strings.TrimSpace(req.Category)
+	if cleanCategory == "" {
+		cleanCategory = "Daily Deliverance"
+	}
+
+	var targetPkg models.Package
+	if strings.TrimSpace(req.PackageID) != "" {
+		if pkgUUID, err := uuid.Parse(req.PackageID); err == nil {
+			_ = db.DB.First(&targetPkg, "id = ?", pkgUUID).Error
+		}
+	}
+
+	if targetPkg.ID == uuid.Nil {
+		// 1. Look for published package in this category
+		err := db.DB.Where("category = ? AND status = ?", cleanCategory, "published").Order("year desc").First(&targetPkg).Error
+		if err != nil {
+			// 2. Look for any draft package in this category
+			err = db.DB.Where("category = ?", cleanCategory).Order("created_at desc").First(&targetPkg).Error
+			if err != nil {
+				// 3. Auto-create a package for this category so devotionals have a valid container
+				targetPkg = models.Package{
+					ID:         uuid.New(),
+					Category:   cleanCategory,
+					Year:       time.Now().Year(),
+					Status:     "published",
+					FileName:   cleanCategory + "_manual_entries.json",
+					UploadedAt: time.Now(),
+				}
+				if err := db.DB.Create(&targetPkg).Error; err != nil {
+					utils.SendError(c, http.StatusInternalServerError, "Failed to create package container", err.Error())
+					return
+				}
+			}
+		}
+	}
+
+	// Format action points as valid JSON array if string provided
+	actionPointsJSON := "[]"
+	if strings.TrimSpace(req.ActionPoints) != "" {
+		trimmed := strings.TrimSpace(req.ActionPoints)
+		if strings.HasPrefix(trimmed, "[") {
+			actionPointsJSON = trimmed
+		} else {
+			lines := strings.Split(trimmed, "\n")
+			var clean []string
+			for _, l := range lines {
+				l = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(l), "-"))
+				l = strings.TrimSpace(strings.TrimPrefix(l, "•"))
+				if l != "" {
+					clean = append(clean, l)
+				}
+			}
+			b, _ := json.Marshal(clean)
+			actionPointsJSON = string(b)
+		}
+	}
+
+	newDevo := models.Devotional{
+		ID:                 uuid.New(),
+		PackageID:          targetPkg.ID,
+		Category:           cleanCategory,
+		DefaultDay:         req.DefaultDay,
+		Title:              strings.TrimSpace(req.Title),
+		ScriptureReference: strings.TrimSpace(req.ScriptureReference),
+		ScriptureQuote:     strings.TrimSpace(req.ScriptureQuote),
+		Body:               strings.TrimSpace(req.Body),
+		Prayer:             strings.TrimSpace(req.Prayer),
+		Reflection:         strings.TrimSpace(req.Reflection),
+		ActionPoints:       actionPointsJSON,
+	}
+
+	if err := db.DB.Create(&newDevo).Error; err != nil {
+		utils.SendError(c, http.StatusInternalServerError, "Failed to create devotional entry: "+err.Error(), err.Error())
+		return
+	}
+
+	// Update package updated_at
+	db.DB.Model(&models.Package{}).Where("id = ?", targetPkg.ID).Update("updated_at", time.Now())
+
+	utils.SendSuccess(c, http.StatusCreated, "Devotional created successfully", newDevo)
+}
+
+// AdminDeleteDevotionalHandler deletes a single devotional by ID
+func AdminDeleteDevotionalHandler(c *gin.Context) {
+	idStr := strings.TrimSpace(c.Param("id"))
+	devotionalID, err := uuid.Parse(idStr)
+	if err != nil {
+		utils.SendError(c, http.StatusBadRequest, "Invalid devotional ID format", err.Error())
+		return
+	}
+
+	var devo models.Devotional
+	if err := db.DB.First(&devo, "id = ?", devotionalID).Error; err != nil {
+		utils.SendError(c, http.StatusNotFound, "Devotional not found", nil)
+		return
+	}
+
+	packageID := devo.PackageID
+
+	if err := db.DB.Delete(&devo).Error; err != nil {
+		utils.SendError(c, http.StatusInternalServerError, "Failed to delete devotional", err.Error())
+		return
+	}
+
+	// Update package total count
+	var totalCount int64
+	db.DB.Model(&models.Devotional{}).Where("package_id = ?", packageID).Count(&totalCount)
+	db.DB.Model(&models.Package{}).Where("id = ?", packageID).Update("total_count", int(totalCount))
+
+	utils.SendSuccess(c, http.StatusOK, "Devotional deleted successfully", nil)
 }

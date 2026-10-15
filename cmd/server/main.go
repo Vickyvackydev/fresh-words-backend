@@ -148,7 +148,9 @@ func registerRoutes(r *gin.Engine) {
 			admin.DELETE("/packages/:id", handlers.DeletePackageHandler)
 
 			// Devotional Operations
+			admin.POST("/devotionals", handlers.AdminCreateDevotionalHandler)
 			admin.PUT("/devotionals/:id", handlers.UpdateDevotionalHandler)
+			admin.DELETE("/devotionals/:id", handlers.AdminDeleteDevotionalHandler)
 			admin.GET("/devotionals/:id/translation", handlers.AdminGetDevotionalTranslationHandler)
 			admin.PUT("/devotionals/:id/translation", handlers.AdminSaveDevotionalTranslationHandler)
 			admin.POST("/devotionals/:id/translation/ai-draft", handlers.AdminGenerateDevotionalAIDraftHandler)

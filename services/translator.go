@@ -234,7 +234,13 @@ func TranslateDevotional(devo *models.Devotional, targetLang string) (*models.De
 		}
 	}
 
-	// 2. If no Gemini API key configured, gracefully return English
+	// 2. Yoruba uses the uploaded authentic collection strictly for the hymnal (Ìwé Orin Mímọ́).
+	// Devotionals are not auto-AI altered for Yoruba, remaining in their original authentic text.
+	if cleanLang == "yo" {
+		return devo, nil
+	}
+
+	// 3. If no Gemini API key configured, gracefully return English
 	if strings.TrimSpace(config.AppConfig.GeminiAPIKey) == "" {
 		return devo, nil
 	}
