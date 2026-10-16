@@ -38,6 +38,36 @@ func GetLanguageName(code string) string {
 	return code
 }
 
+// Data structures for Groq communication
+type groqMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type groqResponseFormat struct {
+	Type string `json:"type"`
+}
+
+type groqRequest struct {
+	Model          string             `json:"model"`
+	Messages       []groqMessage      `json:"messages"`
+	ResponseFormat groqResponseFormat `json:"response_format"`
+	Temperature    float64            `json:"temperature"`
+}
+
+type groqResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+		Code    string `json:"code"`
+	} `json:"error,omitempty"`
+}
+
 // Data structures for JSON communication with Gemini
 type geminiPart struct {
 	Text string `json:"text"`
@@ -81,6 +111,79 @@ type HymnTranslationPayload struct {
 	Verses []string `json:"verses"`
 }
 
+type BibleChapterTranslationPayload struct {
+	Verses []string `json:"verses"`
+}
+
+// CallGroqJSON sends system and user prompts to Groq requesting a JSON response.
+func CallGroqJSON(systemPrompt, userPrompt string) (string, error) {
+	apiKey := strings.TrimSpace(config.AppConfig.GroqAPIKey)
+	if apiKey == "" {
+		return "", errors.New("GROQ_API_KEY is not configured")
+	}
+
+	model := strings.TrimSpace(config.AppConfig.GroqModel)
+	if model == "" {
+		model = "openai/gpt-oss-120b"
+	}
+
+	reqBody := groqRequest{
+		Model: model,
+		Messages: []groqMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+		ResponseFormat: groqResponseFormat{Type: "json_object"},
+		Temperature:    0.2,
+	}
+
+	jsonBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", "https://api.groq.com/openai/v1/chat/completions", bytes.NewBuffer(jsonBytes))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("groq http request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read groq response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("groq returned HTTP %d: %s", resp.StatusCode, string(respBytes))
+	}
+
+	var gResp groqResponse
+	if err := json.Unmarshal(respBytes, &gResp); err != nil {
+		return "", fmt.Errorf("failed to decode groq response: %w", err)
+	}
+
+	if gResp.Error != nil && gResp.Error.Message != "" {
+		return "", fmt.Errorf("groq api error: %s", gResp.Error.Message)
+	}
+
+	if len(gResp.Choices) == 0 || gResp.Choices[0].Message.Content == "" {
+		return "", errors.New("groq returned empty content")
+	}
+
+	return gResp.Choices[0].Message.Content, nil
+}
+
 // CallGeminiJSON sends a prompt to Gemini requesting a JSON response.
 // If the primary model fails or is unavailable (e.g. 404 or 503), it automatically
 // falls back through alternative active Gemini models.
@@ -91,16 +194,16 @@ func CallGeminiJSON(prompt string) (string, error) {
 	}
 
 	primaryModel := strings.TrimSpace(config.AppConfig.GeminiModel)
-	if primaryModel == "" || strings.Contains(primaryModel, "1.5") || strings.Contains(primaryModel, "2.5") {
+	if primaryModel == "" || strings.Contains(primaryModel, "1.5") || strings.Contains(primaryModel, "2.0") || strings.Contains(primaryModel, "2.5") {
 		primaryModel = "gemini-flash-latest" 
 	}
 
 	candidates := []string{primaryModel}
 	fallbacks := []string{
 		"gemini-flash-latest",
-		"gemini-3.5-flash",
-		"gemini-3.7-flash",
 		"gemini-3.8-flash",
+		"gemini-3.7-flash",
+		"gemini-3.5-flash",
 		"gemini-pro-latest",
 	}
 
@@ -160,6 +263,12 @@ func CallGeminiJSON(prompt string) (string, error) {
 			continue
 		}
 
+		if resp.StatusCode == http.StatusTooManyRequests {
+			lastErr = fmt.Errorf("gemini quota exceeded (HTTP 429)")
+			log.Printf("[Translator] %v: quitting Gemini candidate chain early", lastErr)
+			break
+		}
+
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Errorf("gemini returned HTTP %d (model=%s): %s", resp.StatusCode, model, string(respBytes))
 			log.Printf("[Translator] %v; attempting next model...", lastErr)
@@ -187,6 +296,25 @@ func CallGeminiJSON(prompt string) (string, error) {
 	}
 
 	return "", fmt.Errorf("all gemini translation models failed, last error: %w", lastErr)
+}
+
+// CallAIJSON sends the translation request to Groq first (fast, generous free tier),
+// and falls back to Gemini if Groq fails or is unconfigured.
+func CallAIJSON(systemPrompt, userPrompt string) (string, error) {
+	if strings.TrimSpace(config.AppConfig.GroqAPIKey) != "" {
+		out, err := CallGroqJSON(systemPrompt, userPrompt)
+		if err == nil && strings.TrimSpace(out) != "" {
+			return out, nil
+		}
+		log.Printf("[Translator] Groq translation failed (%v); falling back to Gemini...", err)
+	}
+
+	if strings.TrimSpace(config.AppConfig.GeminiAPIKey) != "" {
+		fullPrompt := systemPrompt + "\n\nInput JSON:\n" + userPrompt
+		return CallGeminiJSON(fullPrompt)
+	}
+
+	return "", errors.New("neither GROQ_API_KEY nor GEMINI_API_KEY is configured")
 }
 
 // TranslateDevotional checks the cache first, or calls Gemini to translate into targetLang.
@@ -233,12 +361,12 @@ func TranslateDevotional(devo *models.Devotional, targetLang string) (*models.De
 		}
 	}
 
-	// 2. If no Gemini API key configured, gracefully return English
-	if strings.TrimSpace(config.AppConfig.GeminiAPIKey) == "" {
+	// 2. If neither Groq nor Gemini configured, gracefully return English
+	if strings.TrimSpace(config.AppConfig.GroqAPIKey) == "" && strings.TrimSpace(config.AppConfig.GeminiAPIKey) == "" {
 		return devo, nil
 	}
 
-	// 3. Request Translation from Gemini
+	// 3. Request Translation from AI
 	langName := GetLanguageName(cleanLang)
 	inputData := DevotionalTranslationPayload{
 		Title:              devo.Title,
@@ -255,29 +383,30 @@ func TranslateDevotional(devo *models.Devotional, targetLang string) (*models.De
 	if cleanLang == "yo" {
 		extraGuidelines = "\n- Yoruba Orthography (Àkọtọ́ Èdè Yorùbá): You MUST strictly use accurate Yoruba diacritics, tone marks (àmì ohùn: dọ \\, re, mi /), and sub-dots (ẹ, ọ, ṣ) on all Yoruba words without omission." +
 			"\n- Biblical Register: Use authentic Yoruba ecclesiastical and theological terminology as found in Bíbélì Mímọ́ (e.g., Oore-ọ̀fẹ́, Ìgbàlà, Ìbákẹ́gbẹ́pọ̀, Ẹ̀mí Mímọ́, Olùgbàlà, Òdodo, Ìyàsímímọ́)." +
-			"\n- Natural Expression: Avoid literal, robotic word-for-word translation of English idioms. Write natural, reverent, and deeply inspiring Yoruba."
+			"\n- Natural Expression: Avoid literal, robotic word-for-word translation of English idioms. Write natural, reverent, and deeply inspiring Yoruba." +
+			"\n- Translate scripture references accurately into standard Yoruba (e.g. 'Ecclesiastes 9:15' -> 'Oníwàásù 9:15')."
 	}
 
-	prompt := fmt.Sprintf(
+	systemPrompt := fmt.Sprintf(
 		"You are a revered Christian theologian and expert Bible translator. Translate the following devotional JSON into %s.\n"+
 			"Guidelines:\n"+
 			"- Maintain reverent, sacred biblical language, spiritual depth, and emotional warmth.\n"+
 			"- Retain scripture references (e.g., 'John 3:16') in standard %s Bible format.\n"+
-			"- Preserve all paragraph breaks and markdown formatting in the body.\n"+
-			"- Return a JSON object with the exact keys: 'title', 'scripture_quote', 'scripture_reference', 'body', 'prayer', 'reflection'.%s\n\n"+
-			"Input JSON:\n%s",
-		langName, langName, extraGuidelines, string(inputBytes),
+			"- Preserve all paragraph breaks (\\n\\n) and markdown formatting in the body.\n"+
+			"- Return a JSON object with the exact keys: 'title', 'scripture_quote', 'scripture_reference', 'body', 'prayer', 'reflection'.%s",
+		langName, langName, extraGuidelines,
 	)
+	userPrompt := string(inputBytes)
 
-	jsonStr, geminiErr := CallGeminiJSON(prompt)
-	if geminiErr != nil {
-		log.Printf("[Translator] Gemini devotional translation failed for lang=%s id=%s: %v\n", cleanLang, devo.ID, geminiErr)
+	jsonStr, aiErr := CallAIJSON(systemPrompt, userPrompt)
+	if aiErr != nil {
+		log.Printf("[Translator] AI devotional translation failed for lang=%s id=%s: %v\n", cleanLang, devo.ID, aiErr)
 		return devo, nil // Fallback to original
 	}
 
 	var payload DevotionalTranslationPayload
 	if err := json.Unmarshal([]byte(jsonStr), &payload); err != nil {
-		log.Printf("[Translator] Failed to parse Gemini devotional JSON: %v\n", err)
+		log.Printf("[Translator] Failed to parse AI devotional JSON: %v\n", err)
 		return devo, nil
 	}
 
@@ -326,8 +455,8 @@ func GenerateAIDevotionalDraft(devo *models.Devotional, targetLang string) (*Dev
 		cleanLang = "yo"
 	}
 
-	if strings.TrimSpace(config.AppConfig.GeminiAPIKey) == "" {
-		return nil, errors.New("Gemini API key is not configured")
+	if strings.TrimSpace(config.AppConfig.GroqAPIKey) == "" && strings.TrimSpace(config.AppConfig.GeminiAPIKey) == "" {
+		return nil, errors.New("neither Groq nor Gemini API key is configured")
 	}
 
 	langName := GetLanguageName(cleanLang)
@@ -346,21 +475,22 @@ func GenerateAIDevotionalDraft(devo *models.Devotional, targetLang string) (*Dev
 	if cleanLang == "yo" {
 		extraGuidelines = "\n- Yoruba Orthography (Àkọtọ́ Èdè Yorùbá): You MUST strictly use accurate Yoruba diacritics, tone marks (àmì ohùn: dọ \\, re, mi /), and sub-dots (ẹ, ọ, ṣ) on all Yoruba words without omission." +
 			"\n- Biblical Register: Use authentic Yoruba ecclesiastical and theological terminology as found in Bíbélì Mímọ́ (e.g., Oore-ọ̀fẹ́, Ìgbàlà, Ìbákẹ́gbẹ́pọ̀, Ẹ̀mí Mímọ́, Olùgbàlà, Òdodo, Ìyàsímímọ́)." +
-			"\n- Natural Expression: Avoid literal, robotic word-for-word translation of English idioms. Write natural, reverent, and deeply inspiring Yoruba."
+			"\n- Natural Expression: Avoid literal, robotic word-for-word translation of English idioms. Write natural, reverent, and deeply inspiring Yoruba." +
+			"\n- Translate scripture references accurately into standard Yoruba (e.g. 'Ecclesiastes 9:15' -> 'Oníwàásù 9:15')."
 	}
 
-	prompt := fmt.Sprintf(
+	systemPrompt := fmt.Sprintf(
 		"You are a revered Christian theologian and expert Bible translator. Translate the following devotional JSON into %s.\n"+
 			"Guidelines:\n"+
 			"- Maintain reverent, sacred biblical language, spiritual depth, and emotional warmth.\n"+
 			"- Retain scripture references (e.g., 'John 3:16') in standard %s Bible format.\n"+
-			"- Preserve all paragraph breaks and markdown formatting in the body.\n"+
-			"- Return a JSON object with the exact keys: 'title', 'scripture_quote', 'scripture_reference', 'body', 'prayer', 'reflection'.%s\n\n"+
-			"Input JSON:\n%s",
-		langName, langName, extraGuidelines, string(inputBytes),
+			"- Preserve all paragraph breaks (\\n\\n) and markdown formatting in the body.\n"+
+			"- Return a JSON object with the exact keys: 'title', 'scripture_quote', 'scripture_reference', 'body', 'prayer', 'reflection'.%s",
+		langName, langName, extraGuidelines,
 	)
+	userPrompt := string(inputBytes)
 
-	jsonStr, err := CallGeminiJSON(prompt)
+	jsonStr, err := CallAIJSON(systemPrompt, userPrompt)
 	if err != nil {
 		return nil, fmt.Errorf("AI translation failed: %w", err)
 	}
@@ -373,7 +503,7 @@ func GenerateAIDevotionalDraft(devo *models.Devotional, targetLang string) (*Dev
 	return &payload, nil
 }
 
-// TranslateHymn checks cache, or calls Gemini to translate hymn lyrics into targetLang.
+// TranslateHymn checks cache, or calls AI to translate hymn lyrics into targetLang.
 func TranslateHymn(hymn *models.Hymn, targetLang string) (*models.Hymn, error) {
 	if hymn == nil {
 		return nil, errors.New("hymn is nil")
@@ -418,15 +548,14 @@ func TranslateHymn(hymn *models.Hymn, targetLang string) (*models.Hymn, error) {
 		return hymn, nil
 	}
 
-	// 3. If no Gemini API key configured, gracefully return English
-	if strings.TrimSpace(config.AppConfig.GeminiAPIKey) == "" {
+	// 3. If neither Groq nor Gemini configured, gracefully return English
+	if strings.TrimSpace(config.AppConfig.GroqAPIKey) == "" && strings.TrimSpace(config.AppConfig.GeminiAPIKey) == "" {
 		return hymn, nil
 	}
 
-	// 4. Request Translation from Gemini for other languages
+	// 4. Request Translation from AI for other languages
 	langName := GetLanguageName(cleanLang)
 
-	// Unmarshal existing verses
 	var versesList []string
 	_ = json.Unmarshal([]byte(hymn.Verses), &versesList)
 
@@ -438,30 +567,30 @@ func TranslateHymn(hymn *models.Hymn, targetLang string) (*models.Hymn, error) {
 
 	inputBytes, _ := json.Marshal(inputData)
 
-	prompt := fmt.Sprintf(
+	systemPrompt := fmt.Sprintf(
 		"You are a skilled Christian hymn translator. Translate the following hymn into %s.\n"+
 			"Guidelines:\n"+
-			"- Preserve the musical meter, poetic rhythm, and sacred theological tone.\n"+
+			"- Preserve musical meter, poetic rhythm, and sacred theological tone.\n"+
 			"- Keep each stanza as a separate string element in the 'verses' array, preserving line breaks (\\n) within stanzas.\n"+
-			"- Do NOT add stanza numbers (like '1.' or '2.') to the verse lyrics.\n"+
-			"- Return a JSON object with the exact keys: 'title', 'chorus', and 'verses' (array of strings).\n\n"+
-			"Input JSON:\n%s",
-		langName, string(inputBytes),
+			"- Do NOT add stanza numbers to the verse lyrics.\n"+
+			"- Return a JSON object with the exact keys: 'title', 'chorus', and 'verses' (array of strings).",
+		langName,
 	)
+	userPrompt := string(inputBytes)
 
-	jsonStr, geminiErr := CallGeminiJSON(prompt)
-	if geminiErr != nil {
-		log.Printf("[Translator] Gemini hymn translation failed for lang=%s number=%d: %v\n", cleanLang, hymn.Number, geminiErr)
+	jsonStr, aiErr := CallAIJSON(systemPrompt, userPrompt)
+	if aiErr != nil {
+		log.Printf("[Translator] AI hymn translation failed for lang=%s number=%d: %v\n", cleanLang, hymn.Number, aiErr)
 		return hymn, nil
 	}
 
 	var payload HymnTranslationPayload
 	if err := json.Unmarshal([]byte(jsonStr), &payload); err != nil {
-		log.Printf("[Translator] Failed to parse Gemini hymn JSON: %v\n", err)
+		log.Printf("[Translator] Failed to parse AI hymn JSON: %v\n", err)
 		return hymn, nil
 	}
 
-	// 4. Save to Database Cache
+	// Save to Database Cache
 	savePayload, _ := json.Marshal(payload)
 	transRecord := models.ContentTranslation{
 		ContentType:    "hymn",
@@ -471,7 +600,7 @@ func TranslateHymn(hymn *models.Hymn, targetLang string) (*models.Hymn, error) {
 	}
 	db.DB.Create(&transRecord)
 
-	// 5. Construct translated response
+	// Construct translated response
 	result := *hymn
 	result.IsTranslated = true
 	if payload.Title != "" {
@@ -488,11 +617,7 @@ func TranslateHymn(hymn *models.Hymn, targetLang string) (*models.Hymn, error) {
 	return &result, nil
 }
 
-type BibleChapterTranslationPayload struct {
-	Verses []string `json:"verses"`
-}
-
-// TranslateBibleChapter checks cache first, or calls Gemini to translate chapter verses into targetLang.
+// TranslateBibleChapter checks cache first, or calls AI to translate chapter verses into targetLang.
 func TranslateBibleChapter(book string, chapter int, verses []string, targetLang string) ([]string, error) {
 	if len(verses) == 0 {
 		return verses, nil
@@ -519,38 +644,38 @@ func TranslateBibleChapter(book string, chapter int, verses []string, targetLang
 		}
 	}
 
-	// 2. If no Gemini API key configured, gracefully return original English verses
-	if strings.TrimSpace(config.AppConfig.GeminiAPIKey) == "" {
+	// 2. If neither Groq nor Gemini configured, gracefully return original English verses
+	if strings.TrimSpace(config.AppConfig.GroqAPIKey) == "" && strings.TrimSpace(config.AppConfig.GeminiAPIKey) == "" {
 		return verses, nil
 	}
 
-	// 3. Request Translation from Gemini
+	// 3. Request Translation from AI
 	langName := GetLanguageName(cleanLang)
 	inputData := BibleChapterTranslationPayload{
 		Verses: verses,
 	}
 	inputBytes, _ := json.Marshal(inputData)
 
-	prompt := fmt.Sprintf(
+	systemPrompt := fmt.Sprintf(
 		"You are a revered biblical scholar and Christian Bible translator. Translate the following King James Bible chapter from the Book of %s, Chapter %d into %s.\n"+
 			"Guidelines:\n"+
 			"- Use authentic, sacred scriptural vocabulary matching the recognized historical Bible translation in %s (e.g., Bíbélì Mímọ́ for Yoruba, Louis Segond for French, Reina-Valera for Spanish, Baịbụl Nsọ for Igbo, Littafi Mai Tsarki for Hausa, João Ferreira de Almeida for Portuguese, Amharic Holy Bible for Amharic).\n"+
 			"- Maintain the exact count and order of verses in the 'verses' array.\n"+
 			"- Do NOT add verse numbers to the verse strings.\n"+
-			"- Return a JSON object with the exact key 'verses' (array of strings).\n\n"+
-			"Input JSON:\n%s",
-		book, chapter, langName, langName, string(inputBytes),
+			"- Return a JSON object with the exact key 'verses' (array of strings).",
+		book, chapter, langName, langName,
 	)
+	userPrompt := string(inputBytes)
 
-	jsonStr, geminiErr := CallGeminiJSON(prompt)
-	if geminiErr != nil {
-		log.Printf("[Translator] Gemini Bible chapter translation failed for lang=%s book=%s chapter=%d: %v\n", cleanLang, book, chapter, geminiErr)
+	jsonStr, aiErr := CallAIJSON(systemPrompt, userPrompt)
+	if aiErr != nil {
+		log.Printf("[Translator] AI Bible chapter translation failed for lang=%s book=%s chapter=%d: %v\n", cleanLang, book, chapter, aiErr)
 		return verses, nil
 	}
 
 	var payload BibleChapterTranslationPayload
 	if err := json.Unmarshal([]byte(jsonStr), &payload); err != nil {
-		log.Printf("[Translator] Failed to parse Gemini Bible JSON: %v\n", err)
+		log.Printf("[Translator] Failed to parse AI Bible JSON: %v\n", err)
 		return verses, nil
 	}
 

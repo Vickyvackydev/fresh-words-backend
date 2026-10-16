@@ -21,6 +21,8 @@ type Config struct {
 	AdminPassword string
 	GeminiAPIKey  string
 	GeminiModel   string
+	GroqAPIKey    string
+	GroqModel     string
 }
 
 var AppConfig Config
@@ -44,7 +46,9 @@ func LoadConfig() {
 		AdminEmail:    os.Getenv("ADMIN_EMAIL"),
 		AdminPassword: os.Getenv("ADMIN_PASSWORD"),
 		GeminiAPIKey:  os.Getenv("GEMINI_API_KEY"),
-		GeminiModel:   getEnv("GEMINI_MODEL", "gemini-2.5-flash"),
+		GeminiModel:   getEnv("GEMINI_MODEL", "gemini-flash-latest"),
+		GroqAPIKey:    os.Getenv("GROQ_API_KEY"),
+		GroqModel:     getEnv("GROQ_MODEL", "openai/gpt-oss-120b"),
 	}
 
 	// Validate critical variables
