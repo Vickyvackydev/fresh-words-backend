@@ -91,18 +91,17 @@ func CallGeminiJSON(prompt string) (string, error) {
 	}
 
 	primaryModel := strings.TrimSpace(config.AppConfig.GeminiModel)
-	
-	// If empty or set to a non-existent 2.5 model, default to 1.5
-	if primaryModel == "" || strings.Contains(primaryModel, "2.5") {
-		primaryModel = "gemini-1.5-flash" 
+	if primaryModel == "" || strings.Contains(primaryModel, "1.5") || strings.Contains(primaryModel, "2.5") {
+		primaryModel = "gemini-flash-latest" 
 	}
 
-	// Correct Production Model List (as of late 2024/early 2025)
 	candidates := []string{primaryModel}
 	fallbacks := []string{
-		"gemini-1.5-flash",      // Reliable, fast
-		"gemini-1.5-pro",        // Smarter, more nuanced
-		"gemini-1.5-flash-8b",   // Fast fallback
+		"gemini-flash-latest",
+		"gemini-3.5-flash",
+		"gemini-3.7-flash",
+		"gemini-3.8-flash",
+		"gemini-pro-latest",
 	}
 
 	for _, fb := range fallbacks {
@@ -234,13 +233,7 @@ func TranslateDevotional(devo *models.Devotional, targetLang string) (*models.De
 		}
 	}
 
-	// 2. Yoruba uses the uploaded authentic collection strictly for the hymnal (Ìwé Orin Mímọ́).
-	// Devotionals are not auto-AI altered for Yoruba, remaining in their original authentic text.
-	if cleanLang == "yo" {
-		return devo, nil
-	}
-
-	// 3. If no Gemini API key configured, gracefully return English
+	// 2. If no Gemini API key configured, gracefully return English
 	if strings.TrimSpace(config.AppConfig.GeminiAPIKey) == "" {
 		return devo, nil
 	}
