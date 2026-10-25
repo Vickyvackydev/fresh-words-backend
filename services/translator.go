@@ -116,72 +116,150 @@ type BibleChapterTranslationPayload struct {
 }
 
 // CallGroqJSON sends system and user prompts to Groq requesting a JSON response.
+// If the primary model fails or hits quota/rate limits (e.g. HTTP 429), it automatically
+// cascades through alternative active Groq models with JSON capability.
 func CallGroqJSON(systemPrompt, userPrompt string) (string, error) {
 	apiKey := strings.TrimSpace(config.AppConfig.GroqAPIKey)
 	if apiKey == "" {
 		return "", errors.New("GROQ_API_KEY is not configured")
 	}
 
-	model := strings.TrimSpace(config.AppConfig.GroqModel)
-	if model == "" {
-		model = "openai/gpt-oss-120b"
+	primaryModel := strings.TrimSpace(config.AppConfig.GroqModel)
+	if primaryModel == "" {
+		primaryModel = "openai/gpt-oss-120b"
 	}
 
-	reqBody := groqRequest{
-		Model: model,
-		Messages: []groqMessage{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userPrompt},
-		},
-		ResponseFormat: groqResponseFormat{Type: "json_object"},
-		Temperature:    0.2,
+	candidates := []string{primaryModel}
+	fallbacks := []string{
+		"qwen/qwen3.8-27b",
+		"openai/gpt-oss-20b",
+		"allam-2-7b",
 	}
-
-	jsonBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", err
+	for _, fb := range fallbacks {
+		if fb != primaryModel {
+			candidates = append(candidates, fb)
+		}
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-	defer cancel()
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", "https://api.groq.com/openai/v1/chat/completions", bytes.NewBuffer(jsonBytes))
-	if err != nil {
-		return "", err
-	}
-	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
-	httpReq.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return "", fmt.Errorf("groq http request failed: %w", err)
-	}
-	defer resp.Body.Close()
+	var lastErr error
 
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read groq response: %w", err)
+	for _, model := range candidates {
+		reqBody := groqRequest{
+			Model: model,
+			Messages: []groqMessage{
+				{Role: "system", Content: systemPrompt},
+				{Role: "user", Content: userPrompt},
+			},
+			ResponseFormat: groqResponseFormat{Type: "json_object"},
+			Temperature:    0.2,
+		}
+
+		jsonBytes, err := json.Marshal(reqBody)
+		if err != nil {
+			return "", err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", "https://api.groq.com/openai/v1/chat/completions", bytes.NewBuffer(jsonBytes))
+		if err != nil {
+			cancel()
+			lastErr = err
+			continue
+		}
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+		httpReq.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			cancel()
+			lastErr = fmt.Errorf("groq http request failed (model=%s): %w", model, err)
+			log.Printf("[Translator] %v; trying next Groq candidate...", lastErr)
+			continue
+		}
+
+		respBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		cancel()
+
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read groq response (model=%s): %w", model, err)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("groq returned HTTP %d (model=%s): %s", resp.StatusCode, model, string(respBytes))
+			log.Printf("[Translator] %v; trying next Groq candidate...", lastErr)
+			continue
+		}
+
+		var gResp groqResponse
+		if err := json.Unmarshal(respBytes, &gResp); err != nil {
+			lastErr = fmt.Errorf("failed to decode groq response (model=%s): %w", model, err)
+			continue
+		}
+
+		if gResp.Error != nil && gResp.Error.Message != "" {
+			lastErr = fmt.Errorf("groq api error (model=%s): %s", model, gResp.Error.Message)
+			log.Printf("[Translator] %v; trying next Groq candidate...", lastErr)
+			continue
+		}
+
+		if len(gResp.Choices) == 0 || gResp.Choices[0].Message.Content == "" {
+			lastErr = fmt.Errorf("groq returned empty content (model=%s)", model)
+			continue
+		}
+
+		return gResp.Choices[0].Message.Content, nil
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("groq returned HTTP %d: %s", resp.StatusCode, string(respBytes))
+	return "", fmt.Errorf("all groq translation models failed, last error: %w", lastErr)
+}
+
+// buildDevotionalSystemPrompt builds the system instructions for devotional translation,
+// enforcing authentic, native phrasing and strict orthography especially for Yoruba (Bíbélì Mímọ́).
+func buildDevotionalSystemPrompt(cleanLang string) string {
+	langName := GetLanguageName(cleanLang)
+	if cleanLang == "yo" {
+		return `You are a distinguished Yoruba Christian theologian, native Yoruba linguist, and master Bible translator adhering strictly to the gold standard of Bíbélì Mímọ́ (the canonical Yoruba Holy Bible).
+Translate the provided devotional JSON into authentic, rich, and spiritually moving Yoruba that reads naturally as if written by an elder native Yoruba pastor and Bible scholar.
+
+CRITICAL LINGUISTIC & THEOLOGICAL DIRECTIVES (ÈDÈ YORÙBÁ ÀBÍNIBÍ):
+1. Native Eloquence & Natural Expression:
+   - NEVER translate English idioms or phrases word-for-word. English idioms translated literally sound robotic, disjointed, and foreign to Yoruba speakers.
+   - Use deeply natural, revered Yoruba ecclesiastical language and spiritual warmth.
+   - Example natural translations:
+     * "Walking in faith" -> "Rírìn nínú Ìgbàgbọ́" or "Ìrìn-Àjò Ìgbàgbọ́"
+     * "Trust in the Lord with all your heart" -> "Gbẹ́kẹ̀lé Olúwa pẹ̀lú gbogbo ọkàn rẹ"
+     * "Do not lean on your own understanding" -> "Má sì gbẹ́kẹ̀lé ìmọ̀ tàbí òye ara rẹ"
+     * "Daily devotion / daily bread" -> "Ọ̀rọ̀ Ìyè fún Òní" or "Oúnjẹ Ọjọ́"
+     * "Quiet time / Reflection" -> "Àṣàrò Ọkàn"
+     * "Let us pray / Prayer" -> "Ẹ jẹ́ kí a gbàdúrà / Àdúrà"
+     * "In Jesus' name, Amen" -> "Ní orúkọ Jésù, Àmín."
+
+2. Flawless Diacritics and Tone Marks (Àkọtọ́ Èdè Yorùbá Gidi):
+   - You MUST meticulously use accurate tone marks (àmì ohùn: dọ \, re [unmarked], mi /) and sub-dots (ẹ, ọ, ṣ) on EVERY single Yoruba word without exception.
+   - Standard sacred words must be correctly marked: Ọlọ́run, Jésù Krístì, Olúwa, Ẹ̀mí Mímọ́, Ìgbàgbọ́, Oore-ọ̀fẹ́, Ìgbàlà, Òdodo, Àdúrà, Àlàáfíà, Ìbùkún, Ìrètí, Àṣàrò, Òye, Ọgbọ́n, Ọkàn, Ìyè.
+
+3. Canonical Yoruba Scripture References & Books (Bíbélì Mímọ́):
+   - Always translate Bible book names into authentic Yoruba Bible canon:
+     Genesis -> Jẹ́nẹ́sísì, Exodus -> Ẹ́ḱsódù, Leviticus -> Léfítíkù, Numbers -> Nọ́ḿbà, Deuteronomy -> Diu-tẹ-ronómì, Joshua -> Jóṣúà, Judges -> Àwọn Onídàájọ́, Ruth -> Rúùtù, Samuel -> Sámúẹ́lì, Kings -> Àwọn Ọba, Chronicles -> Kíróníkà, Psalms -> Sáàmù, Proverbs -> Òwe, Ecclesiastes -> Oníwàásù, Isaiah -> Aísáyà, Jeremiah -> Jeremáyà, Ezekiel -> Isíkíẹ́lì, Daniel -> Dáníẹ́lì, Matthew -> Mátíù, Mark -> Máàkù, Luke -> Lúùkù, John -> Jòhánù, Acts -> Ìṣe Àwọn Àpọ́sítélì, Romans -> Róòmù, Corinthians -> Kọ́ríńtì, Galatians -> Gálátíà, Ephesians -> Éfésù, Philippians -> Fílípì, Colossians -> Kólósè, Thessalonians -> Tẹsalóníkà, Timothy -> Tímótì, Titus -> Títù, Hebrews -> Hébérù, James -> Jákọ́bù, Peter -> Pétérù, Revelation -> Ìfihàn.
+   - Keep standard chapter:verse formatting (e.g., "Òwe 3:5-6", "Sáàmù 23:1", "Jòhánù 3:16").
+
+4. Output Structure:
+   - Preserve all paragraph breaks (\n\n) and markdown formatting in the body.
+   - Return STRICT JSON with the exact keys: 'title', 'scripture_quote', 'scripture_reference', 'body', 'prayer', 'reflection'.`
 	}
 
-	var gResp groqResponse
-	if err := json.Unmarshal(respBytes, &gResp); err != nil {
-		return "", fmt.Errorf("failed to decode groq response: %w", err)
-	}
-
-	if gResp.Error != nil && gResp.Error.Message != "" {
-		return "", fmt.Errorf("groq api error: %s", gResp.Error.Message)
-	}
-
-	if len(gResp.Choices) == 0 || gResp.Choices[0].Message.Content == "" {
-		return "", errors.New("groq returned empty content")
-	}
-
-	return gResp.Choices[0].Message.Content, nil
+	return fmt.Sprintf(
+		"You are a revered Christian theologian and expert Bible translator. Translate the following devotional JSON into %s.\n"+
+			"Guidelines:\n"+
+			"- Maintain reverent, sacred biblical language, spiritual depth, and emotional warmth.\n"+
+			"- Retain scripture references (e.g., 'John 3:16') in standard %s Bible format.\n"+
+			"- Preserve all paragraph breaks (\\n\\n) and markdown formatting in the body.\n"+
+			"- Return a JSON object with the exact keys: 'title', 'scripture_quote', 'scripture_reference', 'body', 'prayer', 'reflection'.",
+		langName, langName,
+	)
 }
 
 // CallGeminiJSON sends a prompt to Gemini requesting a JSON response.
@@ -367,7 +445,6 @@ func TranslateDevotional(devo *models.Devotional, targetLang string) (*models.De
 	}
 
 	// 3. Request Translation from AI
-	langName := GetLanguageName(cleanLang)
 	inputData := DevotionalTranslationPayload{
 		Title:              devo.Title,
 		ScriptureQuote:     devo.ScriptureQuote,
@@ -379,23 +456,7 @@ func TranslateDevotional(devo *models.Devotional, targetLang string) (*models.De
 
 	inputBytes, _ := json.Marshal(inputData)
 
-	extraGuidelines := ""
-	if cleanLang == "yo" {
-		extraGuidelines = "\n- Yoruba Orthography (Àkọtọ́ Èdè Yorùbá): You MUST strictly use accurate Yoruba diacritics, tone marks (àmì ohùn: dọ \\, re, mi /), and sub-dots (ẹ, ọ, ṣ) on all Yoruba words without omission." +
-			"\n- Biblical Register: Use authentic Yoruba ecclesiastical and theological terminology as found in Bíbélì Mímọ́ (e.g., Oore-ọ̀fẹ́, Ìgbàlà, Ìbákẹ́gbẹ́pọ̀, Ẹ̀mí Mímọ́, Olùgbàlà, Òdodo, Ìyàsímímọ́)." +
-			"\n- Natural Expression: Avoid literal, robotic word-for-word translation of English idioms. Write natural, reverent, and deeply inspiring Yoruba." +
-			"\n- Translate scripture references accurately into standard Yoruba (e.g. 'Ecclesiastes 9:15' -> 'Oníwàásù 9:15')."
-	}
-
-	systemPrompt := fmt.Sprintf(
-		"You are a revered Christian theologian and expert Bible translator. Translate the following devotional JSON into %s.\n"+
-			"Guidelines:\n"+
-			"- Maintain reverent, sacred biblical language, spiritual depth, and emotional warmth.\n"+
-			"- Retain scripture references (e.g., 'John 3:16') in standard %s Bible format.\n"+
-			"- Preserve all paragraph breaks (\\n\\n) and markdown formatting in the body.\n"+
-			"- Return a JSON object with the exact keys: 'title', 'scripture_quote', 'scripture_reference', 'body', 'prayer', 'reflection'.%s",
-		langName, langName, extraGuidelines,
-	)
+	systemPrompt := buildDevotionalSystemPrompt(cleanLang)
 	userPrompt := string(inputBytes)
 
 	jsonStr, aiErr := CallAIJSON(systemPrompt, userPrompt)
@@ -459,7 +520,6 @@ func GenerateAIDevotionalDraft(devo *models.Devotional, targetLang string) (*Dev
 		return nil, errors.New("neither Groq nor Gemini API key is configured")
 	}
 
-	langName := GetLanguageName(cleanLang)
 	inputData := DevotionalTranslationPayload{
 		Title:              devo.Title,
 		ScriptureQuote:     devo.ScriptureQuote,
@@ -471,23 +531,7 @@ func GenerateAIDevotionalDraft(devo *models.Devotional, targetLang string) (*Dev
 
 	inputBytes, _ := json.Marshal(inputData)
 
-	extraGuidelines := ""
-	if cleanLang == "yo" {
-		extraGuidelines = "\n- Yoruba Orthography (Àkọtọ́ Èdè Yorùbá): You MUST strictly use accurate Yoruba diacritics, tone marks (àmì ohùn: dọ \\, re, mi /), and sub-dots (ẹ, ọ, ṣ) on all Yoruba words without omission." +
-			"\n- Biblical Register: Use authentic Yoruba ecclesiastical and theological terminology as found in Bíbélì Mímọ́ (e.g., Oore-ọ̀fẹ́, Ìgbàlà, Ìbákẹ́gbẹ́pọ̀, Ẹ̀mí Mímọ́, Olùgbàlà, Òdodo, Ìyàsímímọ́)." +
-			"\n- Natural Expression: Avoid literal, robotic word-for-word translation of English idioms. Write natural, reverent, and deeply inspiring Yoruba." +
-			"\n- Translate scripture references accurately into standard Yoruba (e.g. 'Ecclesiastes 9:15' -> 'Oníwàásù 9:15')."
-	}
-
-	systemPrompt := fmt.Sprintf(
-		"You are a revered Christian theologian and expert Bible translator. Translate the following devotional JSON into %s.\n"+
-			"Guidelines:\n"+
-			"- Maintain reverent, sacred biblical language, spiritual depth, and emotional warmth.\n"+
-			"- Retain scripture references (e.g., 'John 3:16') in standard %s Bible format.\n"+
-			"- Preserve all paragraph breaks (\\n\\n) and markdown formatting in the body.\n"+
-			"- Return a JSON object with the exact keys: 'title', 'scripture_quote', 'scripture_reference', 'body', 'prayer', 'reflection'.%s",
-		langName, langName, extraGuidelines,
-	)
+	systemPrompt := buildDevotionalSystemPrompt(cleanLang)
 	userPrompt := string(inputBytes)
 
 	jsonStr, err := CallAIJSON(systemPrompt, userPrompt)
